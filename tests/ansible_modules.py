@@ -211,6 +211,22 @@ class PanelPreflight(unittest.TestCase):
             with self.subTest(target=target), self.assertRaisesRegex(panel.PanelError, 'target'):
                 panel.validate(params)
 
+    def test_subscription_public_url_requires_an_https_origin(self):
+        params = self.fixture()
+        params['subscription_public_url'] = 'https://subscriptions.example.com/'
+        panel.validate(params)
+        self.assertEqual(params['subscription_public_url'], 'https://subscriptions.example.com')
+        for url in ['http://subscriptions.example.com', 'https://admin:secret@example.com',
+                    'https://example.com/sub/', 'https://example.com/?', 'https://example.com/#',
+                    'https://example.com:65536', 'https://example.com\n', '']:
+            params = self.fixture()
+            params['subscription_public_url'] = url
+            with self.subTest(url=url), self.assertRaisesRegex(panel.PanelError, 'HTTPS origin'):
+                panel.validate(params)
+        params = self.fixture()
+        panel.validate(params)
+        self.assertNotIn('subscription_public_url', params)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

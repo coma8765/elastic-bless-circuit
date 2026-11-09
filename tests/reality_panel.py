@@ -141,6 +141,38 @@ def run(engine, image):
         verify_entries([alice], [ingress_a])
         checks.append('real 3x-ui preserves REALITY, Vision, SNI, fingerprint and client credentials')
 
+        def account_state():
+            return {record['email']: (record['uuid'], record['subId'], record['enable'],
+                                     tuple(record.get('inboundIds', [])))
+                    for record in client.call('/panel/api/clients/list')}
+
+        before_accounts = account_state()
+        before_directories = client.call('/panel/api/inbounds/list')
+        api_calls = []
+        original_call = client.call
+
+        def recorded_call(path, data=None):
+            api_calls.append(path)
+            return original_call(path, data)
+
+        client.call = recorded_call
+        module.params['subscription_public_url'] = 'https://subscriptions.example.com/'
+        advertised = reconcile()
+        assert advertised['changed'] and advertised['inbound_ids'] == created['inbound_ids']
+        assert '/panel/api/setting/restartPanel' not in api_calls, 'URL-only update restarted the panel'
+        assert client.call('/panel/api/setting/defaultSettings', {})['subURI'] == 'https://subscriptions.example.com/sub/'
+        assert not reconcile()['changed'], 'public subscription URL rerun was not idempotent'
+        module.params.pop('subscription_public_url')
+        assert not reconcile()['changed'], 'omitting the public URL changed its stored override'
+        fresh = panel_module.Panel(module.params['url'], module.params['username'], password)
+        assert fresh.call('/panel/api/setting/all', {})['subURI'] == 'https://subscriptions.example.com/sub/'
+        assert account_state() == before_accounts, 'public URL update changed existing identities'
+        after_directories = client.call('/panel/api/inbounds/list')
+        assert [(entry['id'], entry['settings'], entry['streamSettings']) for entry in after_directories] == [
+            (entry['id'], entry['settings'], entry['streamSettings']) for entry in before_directories], 'public URL update changed directory profiles'
+        verify_entries([alice], [ingress_a])
+        checks.append('public HTTPS subscription metadata persists without panel restart or identity/profile changes')
+
         original = copy.deepcopy(alice)
         module.params['users'].append(bob)
         assert reconcile()['changed'] and not reconcile()['changed']

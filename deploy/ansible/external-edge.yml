@@ -11,6 +11,8 @@
     edge_hook_path: "{{ external_edge_renewal_hook | default('/etc/letsencrypt/renewal-hooks/deploy/55-vless-external-edge') }}"
     edge_headscale_upstream: "{{ external_edge_headscale_upstream | default('127.0.0.1:18081') }}"
     edge_sub_upstream: "{{ external_edge_subscription_upstream | default('127.0.0.1:2096') }}"
+    edge_subscription_only: "{{ external_edge_subscription_only | default(false) | bool }}"
+    edge_lineage: "/etc/letsencrypt/live/{{ edge_cert_name }}"
     edge_audit_dir: "{{ external_edge_audit_dir | default(playbook_dir + '/../../.local/live') }}"
   tasks:
     - name: Validate the explicitly supplied edge scope
@@ -65,6 +67,13 @@
         that:
           - not edge_existing_conf.stat.exists or edge_conf_marker.stdout == '# Managed by vless external-edge; do not share this file with other services.'
         fail_msg: Target nginx path is not owned by this edge deployment.
+    - name: Refuse reusing the vhost path for another hostname
+      ansible.builtin.assert:
+        that:
+          - edge_conf_path in edge_before.audit.nginx_configs
+          - external_edge_domain in edge_before.audit.nginx_configs[edge_conf_path].server_names
+        fail_msg: This vhost path already serves another hostname; supply a separate nginx configuration path.
+      when: edge_existing_conf.stat.exists
     - name: Preserve the previous owned configuration for rollback
       ansible.builtin.slurp:
         src: "{{ edge_conf_path }}"
@@ -79,6 +88,42 @@
       loop: "{{ edge_before.audit.nginx_configs | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
+      no_log: true
+    - name: Check ownership of the lineage-scoped renewal hook
+      ansible.builtin.stat:
+        path: "{{ edge_hook_path }}"
+      register: edge_existing_hook
+    - name: Read an existing hook ownership marker
+      ansible.builtin.command:
+        argv: [sed, -n, 2p, "{{ edge_hook_path }}"]
+      register: edge_hook_marker
+      when: edge_existing_hook.stat.exists
+      changed_when: false
+      no_log: true
+    - name: Refuse to overwrite an unrelated renewal hook
+      ansible.builtin.assert:
+        that:
+          - not edge_existing_hook.stat.exists or edge_hook_marker.stdout == '# Managed by vless external-edge; only this certificate triggers nginx reload.'
+    - name: Read the already owned renewal hook scope
+      ansible.builtin.slurp:
+        src: "{{ edge_hook_path }}"
+      when: edge_existing_hook.stat.exists
+      register: edge_saved_hook
+      no_log: true
+    - name: Refuse reusing a renewal hook for another certificate
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('"' + edge_lineage + '"') in
+            (edge_saved_hook.content | b64decode)
+        fail_msg: This renewal hook belongs to another certificate; supply a separate hook path.
+      when: edge_existing_hook.stat.exists
+    - name: Refuse sharing the managed certificate lineage with another vhost
+      ansible.builtin.assert:
+        that:
+          - item.key == edge_conf_path or (edge_lineage + '/fullchain.pem') not in (item.value.directives | join(' '))
+        fail_msg: The requested certificate lineage is already used by another vhost; supply a separate certificate name.
+      loop: "{{ edge_before.audit.nginx_configs | dict2items }}"
       no_log: true
     - name: Find existing production ACME accounts without reading account keys
       ansible.builtin.find:
@@ -143,21 +188,6 @@
       ansible.builtin.command:
         argv: [openssl, x509, -in, "/etc/letsencrypt/live/{{ edge_cert_name }}/fullchain.pem", -noout, -checkhost, "{{ external_edge_domain }}", -checkend, '86400']
       changed_when: false
-    - name: Check ownership of the lineage-scoped renewal hook
-      ansible.builtin.stat:
-        path: "{{ edge_hook_path }}"
-      register: edge_existing_hook
-    - name: Read an existing hook ownership marker
-      ansible.builtin.command:
-        argv: [sed, -n, 2p, "{{ edge_hook_path }}"]
-      register: edge_hook_marker
-      when: edge_existing_hook.stat.exists
-      changed_when: false
-      no_log: true
-    - name: Refuse to overwrite an unrelated renewal hook
-      ansible.builtin.assert:
-        that:
-          - not edge_existing_hook.stat.exists or edge_hook_marker.stdout == '# Managed by vless external-edge; only this certificate triggers nginx reload.'
     - name: Install a renewal hook limited to this certificate lineage
       ansible.builtin.template:
         src: templates/external-edge-renewal.sh.j2

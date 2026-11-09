@@ -22,6 +22,7 @@
     password: '{{ hostvars[groups.headscale[0]].panel_password }}'
     users: '{{ hostvars[groups.headscale[0]].managed_users }}'
     ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
+    subscription_public_url: '{{ subscription_public_url }}'
   register: panel_directory
   no_log: true
 - name: Install subscription TLS credentials

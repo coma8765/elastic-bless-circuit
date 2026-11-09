@@ -53,6 +53,9 @@ options:
   subscription_port:
     type: int
     default: 2096
+  subscription_public_url:
+    description: Optional HTTPS origin for advertised subscription links; omission preserves the current override.
+    type: str
 notes:
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
@@ -167,6 +170,8 @@ def validate(params):
             raise PanelError("HTTP panel access is permitted only on loopback; use HTTPS remotely")
     valid_port(params["directory_port"])
     valid_port(params["subscription_port"])
+    if params.get("subscription_public_url") is not None:
+        params["subscription_public_url"] = subscription_origin(params["subscription_public_url"])
     if not params["ingress_endpoints"]:
         raise PanelError("at least one public ingress endpoint is required")
     emails, identifiers = set(), set()
@@ -243,6 +248,25 @@ def is_ip_literal(value):
         return True
     except ValueError:
         return False
+
+
+def subscription_origin(value):
+    try:
+        if (not isinstance(value, str) or not value or
+                any(char.isspace() or ord(char) < 32 for char in value) or
+                "?" in value or "#" in value):
+            raise ValueError()
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or
+                parsed.password is not None or parsed.path not in ("", "/") or
+                parsed.query or parsed.fragment or
+                not (valid_dns_name(parsed.hostname) or is_ip_literal(parsed.hostname))):
+            raise ValueError()
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError()
+        return "https://" + parsed.netloc
+    except (ValueError, TypeError):
+        raise PanelError("subscription_public_url must be an HTTPS origin without credentials, path, query or fragment")
 
 
 def validate_target(target):
@@ -428,15 +452,19 @@ def reconcile(module, panel, proxies):
     settings = panel.call("/panel/api/setting/all", {})
     if not isinstance(settings, dict):
         raise PanelError("panel returned invalid settings")
-    desired_settings = {"subEnable": True, "subPort": params["subscription_port"],
-                        "subPath": "/sub/", "subListen": "0.0.0.0"}
+    listener_settings = {"subEnable": True, "subPort": params["subscription_port"],
+                         "subPath": "/sub/", "subListen": "0.0.0.0"}
+    desired_settings = dict(listener_settings)
+    if params.get("subscription_public_url") is not None:
+        desired_settings["subURI"] = params["subscription_public_url"] + "/sub/"
     if differs(settings, desired_settings):
         changed = True
         if not module.check_mode:
             updated = dict(settings)
             updated.update(desired_settings)
             panel.call("/panel/api/setting/update", updated)
-            panel.restart()
+            if differs(settings, listener_settings):
+                panel.restart()
     return {"changed": changed, "inbound_id": active_ids[0], "inbound_ids": inbound_ids}
 
 
@@ -465,6 +493,7 @@ def main():
             "reality_fingerprint": {"type": "str", "default": "chrome", "choices": ["chrome", "firefox", "safari"]}}},
         "directory_port": {"type": "int", "default": 14443},
         "subscription_port": {"type": "int", "default": 2096},
+        "subscription_public_url": {"type": "str"},
     }, supports_check_mode=True)
     try:
         proxies = validate(module.params)

@@ -5,6 +5,8 @@ Exercises real temporary config files with Docker calls stubbed; never opens
 SSH, reads live credentials, changes DNS or accesses the running deployment.
 """
 import importlib.util
+import base64
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +14,12 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
+
+try:
+    from jinja2 import Environment, StrictUndefined
+    import yaml
+except ImportError:
+    Environment = None
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep these offline tests independent of an installed Ansible controller.
@@ -209,6 +217,92 @@ class ExistingVhostOwnership(unittest.TestCase):
     def test_unterminated_quotes_fail_closed(self):
         with self.assertRaises(ValueError):
             edge_audit.exact_server_names('server { server_name "mesh.example.com; }')
+
+
+@unittest.skipUnless(Environment is not None, 'template checks require the Ansible Jinja2/PyYAML dependencies')
+class EdgeTemplateScope(unittest.TestCase):
+    def setUp(self):
+        self.env = Environment(undefined=StrictUndefined, trim_blocks=True, keep_trailing_newline=True)
+        self.env.filters['b64decode'] = lambda value: base64.b64decode(value).decode()
+        self.template = self.env.from_string((ROOT / 'deploy/ansible/templates/external-edge.conf.j2').read_text())
+        self.context = {'external_edge_domain': 'subscriptions.example.test',
+                        'edge_cert_name': 'vless-edge-subscriptions.example.test',
+                        'edge_sub_upstream': '127.0.0.1:2096',
+                        'edge_headscale_upstream': '127.0.0.1:18081'}
+        self.tasks = yaml.safe_load((ROOT / 'deploy/ansible/external-edge.yml').read_text())[0]['tasks']
+
+    def task(self, name):
+        return next(task for task in self.tasks if task['name'] == name)
+
+    def test_default_combined_mode_keeps_the_existing_rendered_configuration(self):
+        rendered = self.template.render(**self.context)
+        # Captured from the combined template before adding subscription-only mode.
+        self.assertEqual(hashlib.sha256(rendered.encode()).hexdigest(),
+                         '2cf727e0217eac40136960327e39a5665a78aadf867debf6892da5b8a34e12f2')
+        self.assertEqual(rendered, self.template.render(**dict(self.context, edge_subscription_only=False)))
+        self.assertIn('proxy_set_header Upgrade $http_upgrade;', rendered)
+        self.assertIn('proxy_pass http://127.0.0.1:18081;', rendered)
+
+    def test_subscription_only_mode_has_no_admin_or_headscale_forwarding(self):
+        rendered = self.template.render(**dict(self.context, edge_subscription_only=True))
+        self.assertIn('location ^~ /sub/ {', rendered)
+        self.assertIn('proxy_pass http://127.0.0.1:2096;', rendered)
+        self.assertEqual(rendered.count('proxy_pass '), 1)
+        self.assertEqual(rendered.count('location / { return 404; }'), 2)
+        self.assertNotIn('18081', rendered)
+        self.assertNotIn('2053', rendered)
+        self.assertNotIn('Upgrade', rendered)
+        self.assertNotIn('map $http_upgrade', rendered)
+        self.assertNotIn('generate_204', rendered)
+        self.assertEqual(rendered.count('access_log off;'), 2)
+
+    def test_a_second_subscription_host_adds_no_conflicting_upgrade_map(self):
+        combined = self.template.render(**self.context)
+        second = self.template.render(**dict(self.context,
+                                             external_edge_domain='second.example.test',
+                                             edge_cert_name='vless-edge-second.example.test',
+                                             edge_subscription_only=True))
+        self.assertEqual((combined + second).count('map $http_upgrade'), 1)
+        self.assertIn('/live/vless-edge-second.example.test/fullchain.pem;', second)
+        self.assertIn('server_name second.example.test;', second)
+
+    def test_an_owned_vhost_path_cannot_be_reused_for_a_different_hostname(self):
+        task = self.task('Refuse reusing the vhost path for another hostname')
+        conditions = task['ansible.builtin.assert']['that']
+        context = {'edge_conf_path': '/etc/nginx/conf.d/owned.conf',
+                   'external_edge_domain': 'new.example.test',
+                   'edge_before': {'audit': {'nginx_configs': {
+                       '/etc/nginx/conf.d/owned.conf': {'server_names': ['existing.example.test']}}}}}
+        self.assertFalse(all(self.env.compile_expression(condition)(**context) for condition in conditions))
+        context['external_edge_domain'] = 'existing.example.test'
+        self.assertTrue(all(self.env.compile_expression(condition)(**context) for condition in conditions))
+
+    def test_renewal_hook_cannot_be_reused_for_another_lineage(self):
+        task = self.task('Refuse reusing a renewal hook for another certificate')
+        expression = self.env.compile_expression(task['ansible.builtin.assert']['that'][0])
+        existing = 'if [ "$RENEWED_LINEAGE" != "/etc/letsencrypt/live/first" ]; then exit 0; fi'
+        saved = {'content': base64.b64encode(existing.encode()).decode()}
+        self.assertFalse(expression(edge_lineage='/etc/letsencrypt/live/second', edge_saved_hook=saved))
+        self.assertTrue(expression(edge_lineage='/etc/letsencrypt/live/first', edge_saved_hook=saved))
+
+    def test_certificate_lineage_cannot_be_shared_with_another_vhost(self):
+        task = self.task('Refuse sharing the managed certificate lineage with another vhost')
+        expression = self.env.compile_expression(task['ansible.builtin.assert']['that'][0])
+        context = {'edge_conf_path': '/etc/nginx/conf.d/second.conf',
+                   'edge_lineage': '/etc/letsencrypt/live/first',
+                   'item': {'key': '/etc/nginx/conf.d/first.conf', 'value': {
+                       'directives': ['ssl_certificate "/etc/letsencrypt/live/first/fullchain.pem"']}}}
+        self.assertFalse(expression(**context))
+        context['edge_lineage'] = '/etc/letsencrypt/live/second'
+        self.assertTrue(expression(**context))
+
+    def test_scope_guards_run_before_dns_or_certificate_mutations(self):
+        names = [task['name'] for task in self.tasks]
+        boundary = names.index('Create only the authorized DNS-only A record')
+        for name in ['Refuse reusing the vhost path for another hostname',
+                     'Refuse reusing a renewal hook for another certificate',
+                     'Refuse sharing the managed certificate lineage with another vhost']:
+            self.assertLess(names.index(name), boundary)
 
 
 if __name__ == '__main__':

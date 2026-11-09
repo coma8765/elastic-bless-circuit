@@ -27,12 +27,32 @@ Run from the repository root after installing the Ansible dependencies:
 
 ```sh
 ./scripts/ansible.sh -i .local/live/edge-inventory.yml deploy/ansible/external-edge.yml
-python3 tests/edge_modules.py
+.local/ansible-venv/bin/python tests/edge_modules.py
 ```
 
 The playbook reconciles one A record with proxying disabled. It refuses conflicting CNAME/AAAA records or multiple A records. It issues a separate certificate lineage, adds an ownership-marked nginx vhost and a renewal hook that reloads nginx only for that lineage. Existing nginx paths without the ownership marker are not overwritten. Subscription and HTTP redirect requests are not access-logged, so subscription IDs are not written to request logs.
 
-The new HTTPS vhost forwards `/sub/` to the loopback subscription listener; all other paths go to the loopback Headscale listener. The panel admin/API listener remains private and is reached through SSH. Configure Headscale with its public HTTPS `server_url` while disabling backend TLS. If configuring `trusted_proxies`, use the actual proxy peer seen by the container; a host-nginx connection through a Docker publication may arrive from the host bridge gateway rather than loopback. The vhost replaces client-supplied IP headers with the connection's peer address and supports the custom POST upgrade used by Tailscale Control Protocol.
+By default, the HTTPS vhost forwards `/sub/` to the loopback subscription listener and all other paths to the loopback Headscale listener. The panel admin/API listener remains private and is reached through SSH. Configure Headscale with its public HTTPS `server_url` while disabling backend TLS. If configuring `trusted_proxies`, use the actual proxy peer seen by the container; a host-nginx connection through a Docker publication may arrive from the host bridge gateway rather than loopback. The vhost replaces client-supplied IP headers with the connection's peer address and supports the custom POST upgrade used by Tailscale Control Protocol.
+
+## A separate subscription-only hostname
+
+Set `external_edge_subscription_only: true` to add a separate subscription host alongside an existing Headscale edge. In this mode only `/sub/` is proxied; all other HTTP/HTTPS paths return 404. It does not expose the panel admin/API or forward requests to Headscale, and it adds no Headscale upgrade map to nginx. Leaving the flag unset preserves the combined edge's existing output and behavior.
+
+Give every hostname a separate configuration file, certificate lineage, renewal hook and private audit directory. For example, these variables can go on the new host entry in a separate private inventory:
+
+```yaml
+external_edge_domain: subscriptions.example.com
+external_edge_subscription_only: true
+external_edge_nginx_conf: /etc/nginx/conf.d/vless-subscriptions.conf
+external_edge_cert_name: vless-edge-subscriptions.example.com
+external_edge_renewal_hook: /etc/letsencrypt/renewal-hooks/deploy/56-vless-subscriptions
+external_edge_audit_dir: "{{ playbook_dir }}/../../.local/live/subscriptions"
+external_edge_subscription_upstream: 127.0.0.1:2096
+```
+
+The playbook rejects an existing owned vhost path belonging to another hostname, a renewal hook belonging to another certificate, or a certificate lineage referenced by another vhost. These checks run before DNS or certificate changes. Do not repurpose the first edge's inventory by changing only its hostname; retain the original host's paths and create a separate inventory for the new edge.
+
+When a public SNI frontend already exists, provide the optional stream settings below for the new hostname as well. The adapter adds only that hostname's route to the same host-nginx HTTPS listener. Update `subscription_public_url` in the main deployment inventory to generate handoff URLs on the new subscription host; existing UUIDs and subscription IDs do not need to change.
 
 ## Optional existing SNI frontend
 
@@ -49,4 +69,4 @@ The adapter locates exactly one `map $ssl_preread_server_name $tls_backend` and 
 
 Private audit artifacts under `.local/live` record existing container identities, running-process IDs, nginx configuration hashes and public certificate hashes. Newly added containers are allowed; existing running workloads must keep their processes. Containers already stopped or restarting are recorded but their changing start timestamps are not treated as caused by the edge deployment. Audit-file updates are bookkeeping and do not mark an unchanged deployment as changed.
 
-Verify DNS through a public resolver and validate TLS from outside the hosting LAN; NAT reflection can take a different route. A valid certificate with HTTP 502 means the edge is available but its backend is not ready. Once Headscale is running, verify `/health` and enroll a real mesh node. Check existing public sites before and after any optional SNI change. The offline module tests cover preserved map contents, idempotence, conflicting-route refusal, bind-mount inode preservation, check mode and rollback on failed nginx validation.
+Verify DNS through a public resolver and validate TLS from outside the hosting LAN; NAT reflection can take a different route. A valid certificate with HTTP 502 means the edge is available but its backend is not ready. Once Headscale is running, verify `/health` and enroll a real mesh node. Check existing public sites before and after any optional SNI change. The offline module tests cover preserved map contents, idempotence, conflicting-route refusal, bind-mount inode preservation, check mode and rollback on failed nginx validation. Template tests also verify subscription-only routing, default combined-mode compatibility and isolation of configuration/certificate/renewal-hook ownership; these use the Jinja2/PyYAML dependencies installed with Ansible.
