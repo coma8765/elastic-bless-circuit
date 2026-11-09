@@ -33,6 +33,12 @@ Headscale outages do not necessarily interrupt established peer communication, b
 
 Control's admin/API listener is reachable by authorized ingress nodes over the mesh. Admin and subscriptions should have separate HTTPS reverse proxy routes: admin authenticated/private, subscription public with unguessable per-user subscription IDs. Never expose the directory inbound as a data-plane entry point. Its `externalProxy` metadata tells subscriptions to use the real ingress public endpoints.
 
+## Mesh UDP port alignment
+
+`mesh.udp_port` selects the actual `tailscaled` listener from YAML and defaults to 41641. The entrypoint validates it with `node-agent mesh-port /etc/node/config.yaml` before starting the daemon. The command works for control YAML without a data-plane role and rejects nonnumeric or out-of-range ports.
+
+When the host already runs Tailscale on UDP 41641, choose another port for the container, for example `mesh.udp_port: 41642`, and publish **41642:41642/udp**. Keep the daemon port, Docker/Podman host publication and any upstream NAT forwarding aligned. Merely publishing 41642 to an unchanged container port 41641 can collide with the host daemon's outgoing NAT state and leave peers using DERP. In Ansible, set the per-host `mesh_udp_port` and matching `mesh_udp_publish` together. Distinct colocated node containers also need distinct ports. Port alignment helps direct reachability; provider firewall/NAT behavior must still permit the resulting UDP endpoint.
+
 ## Configuration lifecycle
 
 The agent reads YAML at startup. Restart after changing policy, certificates, Headscale enrollment or node addresses. It polls panel users independently, reusing its authenticated CSRF/session cookies and reauthenticating after errors or credential changes. Only one configured panel inbound is authoritative. UUIDs and emails must be unique; every active user must have an explicit allowed route. Unknown routes or malformed snapshots retain the prior valid set. Empty or disabled directory inbounds legitimately remove all users.

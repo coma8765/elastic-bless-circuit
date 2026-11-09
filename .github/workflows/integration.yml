@@ -57,6 +57,21 @@ jobs:
               exit 1
             fi
           done
+      - name: Test REALITY identities and isolated panel subscriptions
+        run: |
+          if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/container_overrides.py --engine podman > .local/ci-private/container-overrides.log 2>&1; then
+            echo "::error::Container DNS/hosts override reconciliation failed."
+            exit 1
+          fi
+          if ! .local/ansible-venv/bin/python tests/reality_keys.py > .local/ci-private/reality-keys.log 2>&1; then
+            echo "::error::REALITY identity persistence or security checks failed."
+            exit 1
+          fi
+          if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/reality_panel.py > .local/ci-private/reality-panel.log 2>&1; then
+            echo "::error::Isolated REALITY/Vision subscription or account/node continuity checks failed. Generated credentials are not uploaded."
+            exit 1
+          fi
+          echo 'REALITY identity persistence, Vision subscription metadata and distinct-key ingress growth checks passed.' >> "$GITHUB_STEP_SUMMARY"
       - name: Test Ansible idempotence and account continuity
         run: |
           if ! sudo env PATH="$PATH" "$(command -v python)" tests/ansible.py > .local/ci-private/ansible.log 2>&1; then

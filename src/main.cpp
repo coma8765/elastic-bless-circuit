@@ -270,6 +270,97 @@ static int port(const YAML::Node &n) {
     throw std::runtime_error("port must be in 1..65535");
   return value;
 }
+static int mesh_udp_port(const YAML::Node &c) {
+  const auto mesh = c["mesh"];
+  return mesh && mesh["udp_port"] ? port(mesh["udp_port"]) : 41641;
+}
+static bool dns_hostname(const std::string &name) {
+  if (name.empty() || name.size() > 253 || name.find('*') != std::string::npos)
+    return false;
+  static const std::regex label(
+      "[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?");
+  size_t begin = 0;
+  while (begin < name.size()) {
+    auto end = name.find('.', begin);
+    if (end == std::string::npos)
+      end = name.size();
+    if (!std::regex_match(name.substr(begin, end - begin), label))
+      return false;
+    begin = end + 1;
+  }
+  return name.back() != '.';
+}
+static bool ip_literal(const std::string &name) {
+  in_addr ipv4{};
+  in6_addr ipv6{};
+  return inet_pton(AF_INET, name.c_str(), &ipv4) == 1 ||
+         inet_pton(AF_INET6, name.c_str(), &ipv6) == 1;
+}
+static void reality_stream(const YAML::Node &c, J &stream) {
+  if (stream.value("security", "none") != "reality")
+    return;
+  const auto network = stream.value("network", "tcp");
+  if (network != "tcp" && network != "raw")
+    throw std::runtime_error("REALITY ingress currently requires TCP/RAW");
+  auto settings = c["listener"]["stream"]["realitySettings"];
+  if (!settings || !settings.IsMap() || !settings["private_key_file"])
+    throw std::runtime_error(
+        "REALITY requires realitySettings.private_key_file");
+  auto &reality = stream["realitySettings"];
+  if (reality.contains("privateKey"))
+    throw std::runtime_error(
+        "use private_key_file instead of an inline REALITY private key");
+  const auto key = secret(settings["private_key_file"]);
+  if (!std::regex_match(key, std::regex("[A-Za-z0-9_-]{43}")))
+    throw std::runtime_error(
+        "REALITY private key must be a raw URL-base64 X25519 key");
+  const auto target = reality.value("target", std::string());
+  const auto separator = target.rfind(':');
+  if (separator == std::string::npos || separator == 0 ||
+      separator + 1 == target.size())
+    throw std::runtime_error(
+        "REALITY target must be hostname:port or [IPv6]:port");
+  const auto host = target.substr(0, separator),
+             service = target.substr(separator + 1);
+  in6_addr ipv6{};
+  if (!dns_hostname(host) &&
+      !(host.front() == '[' && host.back() == ']' &&
+        inet_pton(AF_INET6, host.substr(1, host.size() - 2).c_str(), &ipv6) ==
+            1))
+    throw std::runtime_error("REALITY target hostname is invalid");
+  if (!std::regex_match(service, std::regex("[0-9]{1,5}")) ||
+      std::stoi(service) < 1 || std::stoi(service) > 65535)
+    throw std::runtime_error("REALITY target port must be in 1..65535");
+  if (!reality.contains("serverNames") || !reality["serverNames"].is_array() ||
+      reality["serverNames"].empty())
+    throw std::runtime_error("REALITY requires at least one serverName");
+  for (const auto &name : reality["serverNames"])
+    if (!name.is_string() || !dns_hostname(name.get<std::string>()) ||
+        ip_literal(name.get<std::string>()))
+      throw std::runtime_error(
+          "REALITY serverNames must be exact nonempty DNS names");
+  if (!reality.contains("shortIds") || !reality["shortIds"].is_array() ||
+      reality["shortIds"].empty())
+    throw std::runtime_error("REALITY requires at least one shortId");
+  std::set<std::string> short_ids;
+  for (const auto &value : reality["shortIds"]) {
+    if (!value.is_string())
+      throw std::runtime_error("REALITY shortIds must be quoted hex strings");
+    auto id = value.get<std::string>();
+    if (id.size() > 16 || id.size() % 2 != 0 ||
+        !std::regex_match(id, std::regex("[0-9a-fA-F]*")))
+      throw std::runtime_error(
+          "REALITY shortIds must contain 0..16 even-length hex characters");
+    std::transform(id.begin(), id.end(), id.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    id.resize(16, '0');
+    if (!short_ids.insert(id).second)
+      throw std::runtime_error("duplicate REALITY shortId");
+  }
+  reality.erase("private_key_file");
+  reality["privateKey"] = key;
+}
 static J render(const YAML::Node &c, const J &users) {
   std::string role = c["role"].as<std::string>();
   if (role != "in" && role != "out")
@@ -286,6 +377,7 @@ static J render(const YAML::Node &c, const J &users) {
       stream.value("security", "none") != "reality" &&
       !c["allow_insecure_lab"].as<bool>(false))
     throw std::runtime_error("public listener requires TLS or REALITY");
+  reality_stream(c, stream);
   auto address = c["listener"]["address"].as<std::string>();
   if (address == "mesh")
     address = read("/run/mesh-ip");
@@ -425,7 +517,8 @@ static void mesh(const YAML::Node &c) {
   // Redirection without a shell; file contains only the selected mesh IPv4.
   auto p = fork();
   if (p == 0) {
-    freopen("/run/mesh-ip", "w", stdout);
+    if (!freopen("/run/mesh-ip", "w", stdout))
+      _exit(127);
     execlp("tailscale", "tailscale", "ip", "-4", nullptr);
     _exit(127);
   }
@@ -439,11 +532,15 @@ static void mesh(const YAML::Node &c) {
 int main(int argc, char **argv) {
   try {
     if (argc < 3)
-      throw std::runtime_error(
-          "usage: node-agent render|run config.yaml [users.json]");
+      throw std::runtime_error("usage: node-agent render|run|control|mesh-port "
+                               "config.yaml [users.json]");
     umask(0077);
     curl_global_init(CURL_GLOBAL_DEFAULT);
     auto c = YAML::LoadFile(argv[2]);
+    if (std::string(argv[1]) == "mesh-port") {
+      std::cout << mesh_udp_port(c) << '\n';
+      return 0;
+    }
     if (std::string(argv[1]) == "render") {
       J users = argc > 3 ? J::parse(read(argv[3])) : jsonyaml(c["users"]);
       if (users.is_null())

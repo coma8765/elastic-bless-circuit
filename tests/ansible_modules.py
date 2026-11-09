@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Security preflight regressions; run with the deployment's Ansible venv Python."""
 import copy
+import base64
 import importlib.util
 from pathlib import Path
 import shutil
+import secrets
 import ssl
 import subprocess
 import sys
@@ -148,6 +150,66 @@ class PanelPreflight(unittest.TestCase):
         params['ingress_endpoints'][0]['security'] = 'none'
         with self.assertRaisesRegex(panel.PanelError, 'TLS'):
             panel.validate(params)
+
+    def reality_fixture(self):
+        params = self.fixture()
+        params['ingress_endpoints'][0].update(
+            security='reality', reality_target='www.microsoft.com:443',
+            reality_server_name='www.microsoft.com', reality_short_id='0123456789abcdef',
+            reality_public_key=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))
+        return params
+
+    def test_reality_profiles_keep_ingress_keys_out_of_control_private_settings(self):
+        params = self.reality_fixture()
+        proxy = panel.validate(params)[0]
+        endpoint = params['ingress_endpoints'][0]
+        stream = panel.directory_stream(endpoint, proxy)
+        self.assertEqual(params['users'][0]['flow'], 'xtls-rprx-vision')
+        reality = stream['realitySettings']
+        self.assertEqual(stream['security'], 'reality')
+        self.assertEqual(reality['settings']['publicKey'], endpoint['reality_public_key'])
+        self.assertEqual(reality['shortIds'], [endpoint['reality_short_id']])
+        self.assertEqual(reality['serverNames'], [endpoint['reality_server_name']])
+        self.assertNotEqual(reality['privateKey'], endpoint['reality_public_key'])
+        self.assertEqual(panel.directory_stream(endpoint, proxy, {'streamSettings': stream}), stream)
+
+    def test_reality_rejects_mixed_profiles_or_missing_client_credentials(self):
+        for field in ['reality_public_key', 'reality_short_id', 'reality_target', 'reality_server_name']:
+            params = self.reality_fixture()
+            del params['ingress_endpoints'][0][field]
+            with self.subTest(field=field), self.assertRaises(panel.PanelError):
+                panel.validate(params)
+        params = self.reality_fixture()
+        second = copy.deepcopy(params['ingress_endpoints'][0])
+        second.update(address='another.example.com', security='tls')
+        params['ingress_endpoints'].append(second)
+        with self.assertRaisesRegex(panel.PanelError, 'mixed'):
+            panel.validate(params)
+
+    def test_managed_tls_rejects_vision_flow_in_its_plain_directory(self):
+        params = self.fixture()
+        params['users'][0]['flow'] = 'xtls-rprx-vision'
+        with self.assertRaisesRegex(panel.PanelError, 'empty flow'):
+            panel.validate(params)
+
+    def test_reality_sni_rejects_ip_literals_but_target_ips_remain_valid(self):
+        for address in ['1.1.1.1', '::1']:
+            params = self.reality_fixture()
+            params['ingress_endpoints'][0]['reality_server_name'] = address
+            with self.subTest(server_name=address), self.assertRaisesRegex(panel.PanelError, 'SNI'):
+                panel.validate(params)
+        for target in ['1.1.1.1:443', '[2606:4700:4700::1111]:443']:
+            params = self.reality_fixture()
+            params['ingress_endpoints'][0]['reality_target'] = target
+            self.assertEqual(len(panel.validate(params)), 1)
+
+    def test_reality_target_rejects_url_query_and_fragment(self):
+        for target in ['example.com:443?invalid=1', 'example.com:443#fragment',
+                       'example.com:443?', 'example.com:443#', 'example.com:443\n']:
+            params = self.reality_fixture()
+            params['ingress_endpoints'][0]['reality_target'] = target
+            with self.subTest(target=target), self.assertRaisesRegex(panel.PanelError, 'target'):
+                panel.validate(params)
 
 
 if __name__ == '__main__':

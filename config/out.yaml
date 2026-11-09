@@ -1,6 +1,7 @@
 role: out
 mesh:
   enabled: true
+  udp_port: 41641
   server: https://headscale.example.com
   hostname: out-eu-1
   auth_key_file: /run/secrets/headscale-key

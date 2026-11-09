@@ -15,8 +15,12 @@ cmake --build build/ci --parallel 2
 "$ci_python" -m compileall -q tests scripts deploy/ansible/library
 "$ci_python" tests/ansible_modules.py
 "$ci_python" tests/ansible_guards.py
+"$ci_python" tests/reality_keys.py
+"$ci_python" tests/edge_modules.py
+"$ci_python" tests/build_staging.py
 for ci_inventory in inventory.local.yml inventory.example.yml; do
   for ci_playbook in site.yml build.yml; do
     ./scripts/ansible.sh -i "deploy/ansible/$ci_inventory" --syntax-check "deploy/ansible/$ci_playbook"
   done
 done
+./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/external-edge.yml

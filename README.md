@@ -60,6 +60,8 @@ Completed results: [docs/ansible-verification.md](docs/ansible-verification.md).
 
 ## Production configuration
 
+For REALITY with `xtls-rprx-vision`, use [config/in-reality.yaml](config/in-reality.yaml) and the [REALITY configuration guide](docs/reality.md). The existing TLS profile remains supported.
+
 Use [config/in.yaml](config/in.yaml), [config/out.yaml](config/out.yaml) and [config/control.yaml](config/control.yaml). Create the files referenced under `/run/secrets`; mount them read-only from `secrets/{in,out,control}`. Generate distinct UUIDs for transit credentials and users. Share an exit's transit credential only with its authorized ingresses. Provision a separate Headscale auth key for each node; persist node identity volumes and back up 3x-ui's database.
 
 On each corresponding Linux host:

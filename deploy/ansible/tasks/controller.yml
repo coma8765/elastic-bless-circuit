@@ -32,7 +32,7 @@
     path: "{{ controller_state_dir }}/{{ item }}"
     state: directory
     mode: '0700'
-  loop: ['', tls, users, transit, enrollment]
+  loop: ['', tls, users, transit, enrollment, reality]
   delegate_to: localhost
   become: false
 - name: Persist UUID entropy and subscription tokens
@@ -78,10 +78,45 @@
     managed_users: "{{ managed_users + [dict(email=item.email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.email + '.sub'), enabled=item.enabled | default(true))] }}"
   loop: "{{ vless_users }}"
   no_log: true
-- name: Assemble public ingress endpoints
+- name: Validate ingress transport selection
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].ingress_security in ['tls', 'reality']
+  loop: "{{ groups.ingress }}"
+- name: Require consistent flow semantics across managed ingress nodes
+  ansible.builtin.assert:
+    that:
+      - groups.ingress | map('extract', hostvars, 'ingress_security') | unique | length == 1
+    fail_msg: "Use separate control deployments for TLS and REALITY ingress; shared users have one flow setting."
+- name: Persist independent REALITY identities on the controller
+  vless_reality_key:
+    path: "{{ controller_state_dir }}/reality/{{ item }}.json"
+  loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'reality'
+  register: reality_keys
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Initialize public REALITY identity map
+  ansible.builtin.set_fact:
+    reality_identities: {}
+- name: Assemble public REALITY metadata
+  ansible.builtin.set_fact:
+    reality_identities: "{{ reality_identities | combine({item.item: dict(public_key=item.public_key, short_id=item.short_id)}) }}"
+  loop: "{{ reality_keys.results }}"
+  when: not (item.skipped | default(false))
+  no_log: true
+- name: Assemble public TLS ingress endpoints
   ansible.builtin.set_fact:
     ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
   loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'tls'
+- name: Assemble public REALITY ingress endpoints
+  ansible.builtin.set_fact:
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint)] }}"
+  loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'reality'
+  no_log: true
 - name: Generate local test certificates only
   ansible.builtin.command:
     argv:
@@ -108,7 +143,9 @@
   vars:
     cert_name: "{{ (headscale_url | urlsplit('hostname')) if item == 'headscale' else ('subscriptions.vless.test' if item == 'control' else hostvars[item].ingress_server_name) }}"
   loop: "{{ ['headscale', 'control'] + groups.ingress }}"
-  when: local_mode | bool
+  when:
+    - local_mode | bool
+    - (item == 'headscale' and not (headscale_external_tls | bool)) or (item == 'control' and (gateway_enabled | bool)) or (item in groups.ingress and hostvars[item].ingress_security == 'tls')
   delegate_to: localhost
   become: false
   no_log: true
@@ -117,7 +154,9 @@
     path: "{{ controller_state_dir }}/tls/{{ item }}.key"
     mode: '0600'
   loop: "{{ ['headscale', 'control'] + groups.ingress }}"
-  when: local_mode | bool
+  when:
+    - local_mode | bool
+    - (item == 'headscale' and not (headscale_external_tls | bool)) or (item == 'control' and (gateway_enabled | bool)) or (item in groups.ingress and hostvars[item].ingress_security == 'tls')
   delegate_to: localhost
   become: false
 - name: Validate control certificates before changing remote services
@@ -126,8 +165,9 @@
     key_path: "{{ item.key }}"
     hostname: "{{ item.hostname }}"
   loop:
-    - {cert: "{{ headscale_tls_cert }}", key: "{{ headscale_tls_key }}", hostname: "{{ headscale_url | urlsplit('hostname') }}"}
-    - {cert: "{{ control_tls_cert }}", key: "{{ control_tls_key }}", hostname: "{{ subscription_public_url | urlsplit('hostname') }}"}
+    - {cert: "{{ headscale_tls_cert }}", key: "{{ headscale_tls_key }}", hostname: "{{ headscale_url | urlsplit('hostname') }}", enabled: "{{ not (headscale_external_tls | bool) }}"}
+    - {cert: "{{ control_tls_cert }}", key: "{{ control_tls_key }}", hostname: "{{ subscription_public_url | urlsplit('hostname') }}", enabled: "{{ gateway_enabled | bool }}"}
+  when: item.enabled | bool
   delegate_to: localhost
   become: false
 - name: Validate ingress certificates before changing remote services
@@ -136,6 +176,7 @@
     key_path: "{{ hostvars[item].ingress_tls_key }}"
     hostname: "{{ hostvars[item].ingress_server_name }}"
   loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'tls'
   delegate_to: localhost
   become: false
 - name: Write private subscription handoff data

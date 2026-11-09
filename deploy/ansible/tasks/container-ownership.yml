@@ -1,0 +1,18 @@
+- name: Inspect the candidate container's deployment label only
+  ansible.builtin.command:
+    argv:
+      - "{{ container_engine }}"
+      - container
+      - inspect
+      - --format
+      - "{{ '{{ index .Config.Labels \"io.vless.deployment\" }}' }}"
+      - "{{ owned_container_name }}"
+  environment: "{{ container_cli_environment }}"
+  register: candidate_container_owner
+  changed_when: false
+  failed_when: false
+- name: Refuse to adopt a same-name unrelated container
+  ansible.builtin.assert:
+    that:
+      - candidate_container_owner.rc != 0 or candidate_container_owner.stdout | trim == deployment_id
+    fail_msg: "The requested container name already belongs to another service; choose a different deployment_id."

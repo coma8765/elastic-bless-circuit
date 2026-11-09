@@ -6,7 +6,17 @@ deployment_root: "/opt/vless/{{ deployment_id }}"
 local_mode: false
 install_packages: true
 build_images: true
+container_engine: podman
+# Retain the legacy variable so existing Podman inventories remain compatible.
 podman_network: "{{ deployment_id }}-mesh"
+container_network: "{{ podman_network }}"
+docker_host: unix:///var/run/docker.sock
+container_dns_servers: []
+container_extra_hosts: {}
+container_cli_environment: "{{ {'DOCKER_HOST': docker_host} if container_engine == 'docker' else {} }}"
+docker_minimum_version: '20.10'
+podman_minimum_version: '4.9'
+prepare_images_by_role: true
 node_image: localhost/vless-node:dev
 control_image: localhost/vless-control:dev
 headscale_image: localhost/vless-headscale:dev
@@ -14,7 +24,8 @@ gateway_image: localhost/vless-gateway:dev
 container_name: "{{ deployment_id }}-{{ inventory_hostname }}"
 node_dir: "{{ deployment_root }}/{{ inventory_hostname }}"
 headscale_url: https://headscale.example.com
-headscale_publish: ["443:443/tcp"]
+headscale_external_tls: false
+headscale_publish: "{{ ['127.0.0.1:18081:8080/tcp'] if headscale_external_tls | bool else ['443:443/tcp'] }}"
 headscale_tls_cert: "{{ controller_state_dir }}/tls/headscale.crt"
 headscale_tls_key: "{{ controller_state_dir }}/tls/headscale.key"
 # Empty uses the operating system trust store. Supply a CA file for private PKI.
@@ -27,8 +38,14 @@ panel_username: mesh-admin
 panel_host_port: 2053
 subscription_host_port: 2096
 subscription_public_url: https://subscriptions.example.com
+gateway_enabled: true
 gateway_publish: ["443:443/tcp"]
-mesh_udp_publish: ["41641:41641/udp"]
+mesh_udp_port: 41641
+mesh_udp_publish: ["{{ mesh_udp_port }}:{{ mesh_udp_port }}/udp"]
+ingress_security: tls
+ingress_reality_target: www.microsoft.com:443
+ingress_reality_server_name: www.microsoft.com
+ingress_reality_fingerprint: chrome
 ingress_port: 443
 ingress_public_port: 443
 ingress_publish: ["443:443/tcp"]

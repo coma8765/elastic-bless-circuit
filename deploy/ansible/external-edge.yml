@@ -1,0 +1,262 @@
+---
+# Integrate with an existing nginx/Certbot host without replacing its services.
+# Put hostnames, addresses and credential paths in a private inventory.
+- name: Configure a scoped external Headscale and subscription edge
+  hosts: external_edge
+  gather_facts: false
+  become: true
+  vars:
+    edge_cert_name: "{{ external_edge_cert_name | default('vless-edge-' + external_edge_domain) }}"
+    edge_conf_path: "{{ external_edge_nginx_conf | default('/etc/nginx/conf.d/vless-external-edge.conf') }}"
+    edge_hook_path: "{{ external_edge_renewal_hook | default('/etc/letsencrypt/renewal-hooks/deploy/55-vless-external-edge') }}"
+    edge_headscale_upstream: "{{ external_edge_headscale_upstream | default('127.0.0.1:18081') }}"
+    edge_sub_upstream: "{{ external_edge_subscription_upstream | default('127.0.0.1:2096') }}"
+    edge_audit_dir: "{{ external_edge_audit_dir | default(playbook_dir + '/../../.local/live') }}"
+  tasks:
+    - name: Validate the explicitly supplied edge scope
+      ansible.builtin.assert:
+        that:
+          - external_edge_domain is match('^[a-z0-9][a-z0-9.-]+[a-z0-9]$')
+          - external_edge_zone is match('^[a-z0-9][a-z0-9.-]+[a-z0-9]$')
+          - external_edge_ipv4 is match('^[0-9.]+$')
+          - edge_cert_name is match('^[a-z0-9][a-z0-9.-]+$')
+          - edge_headscale_upstream is match('^127[.]0[.]0[.]1:[0-9]{1,5}$')
+          - edge_sub_upstream is match('^127[.]0[.]0[.]1:[0-9]{1,5}$')
+          - edge_conf_path is match('^/etc/nginx/conf[.]d/[a-zA-Z0-9_.-]+[.]conf$')
+          - edge_hook_path is match('^/etc/letsencrypt/renewal-hooks/deploy/[a-zA-Z0-9_.-]+$')
+          - not ansible_check_mode
+        fail_msg: Provide a scoped private inventory; initial TLS issuance does not support check mode.
+    - name: Verify the existing nginx configuration before making changes
+      ansible.builtin.command: /usr/sbin/nginx -t
+      changed_when: false
+    - name: Capture existing workload identities and public nginx metadata
+      vless_edge_audit:
+      register: edge_before
+      no_log: true
+    - name: Prepare private controller audit directory
+      ansible.builtin.file:
+        path: "{{ edge_audit_dir }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+    - name: Preserve the pre-change audit privately
+      ansible.builtin.copy:
+        content: "{{ edge_before.audit | to_nice_json }}"
+        dest: "{{ edge_audit_dir }}/edge-baseline.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+    - name: Check ownership of the target vhost
+      ansible.builtin.stat:
+        path: "{{ edge_conf_path }}"
+      register: edge_existing_conf
+    - name: Read ownership marker of an existing target vhost
+      ansible.builtin.command:
+        argv: [head, -n, '1', "{{ edge_conf_path }}"]
+      when: edge_existing_conf.stat.exists
+      register: edge_conf_marker
+      changed_when: false
+      no_log: true
+    - name: Refuse to overwrite an unrelated nginx configuration
+      ansible.builtin.assert:
+        that:
+          - not edge_existing_conf.stat.exists or edge_conf_marker.stdout == '# Managed by vless external-edge; do not share this file with other services.'
+        fail_msg: Target nginx path is not owned by this edge deployment.
+    - name: Preserve the previous owned configuration for rollback
+      ansible.builtin.slurp:
+        src: "{{ edge_conf_path }}"
+      when: edge_existing_conf.stat.exists
+      register: edge_previous_conf
+      no_log: true
+    - name: Refuse a duplicate exact hostname in an unrelated vhost
+      ansible.builtin.assert:
+        that:
+          - item.key == edge_conf_path or external_edge_domain not in item.value.server_names
+        fail_msg: The requested hostname already belongs to another nginx configuration.
+      loop: "{{ edge_before.audit.nginx_configs | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      no_log: true
+    - name: Find existing production ACME accounts without reading account keys
+      ansible.builtin.find:
+        paths: /etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory
+        file_type: directory
+        recurse: false
+      register: edge_accounts
+    - name: Require an unambiguous existing ACME account
+      ansible.builtin.assert:
+        that:
+          - external_edge_acme_account is defined or edge_accounts.matched == 1
+        fail_msg: Specify an existing ACME account ID; this playbook will not register an account or accept new terms.
+    - name: Select the existing ACME account
+      ansible.builtin.set_fact:
+        edge_acme_account: "{{ external_edge_acme_account | default(edge_accounts.files[0].path | basename) }}"
+    - name: Create only the authorized DNS-only A record
+      vless_cloudflare_record:
+        zone: "{{ external_edge_zone }}"
+        name: "{{ external_edge_domain }}"
+        ipv4: "{{ external_edge_ipv4 }}"
+        credentials_file: "{{ external_edge_cf_credentials }}"
+      register: edge_dns
+      no_log: true
+    - name: Inspect the owned certificate before issuance
+      ansible.builtin.stat:
+        path: "/etc/letsencrypt/live/{{ edge_cert_name }}/fullchain.pem"
+        checksum_algorithm: sha256
+        follow: true
+      register: edge_certificate_before
+    - name: Issue or retain the isolated certificate using the existing ACME account
+      ansible.builtin.command:
+        argv:
+          - certbot
+          - certonly
+          - --non-interactive
+          - --keep-until-expiring
+          - --reuse-key
+          - --no-directory-hooks
+          - --account
+          - "{{ edge_acme_account }}"
+          - --cert-name
+          - "{{ edge_cert_name }}"
+          - --domains
+          - "{{ external_edge_domain }}"
+          - --dns-cloudflare
+          - --dns-cloudflare-credentials
+          - "{{ external_edge_cf_credentials }}"
+          - --dns-cloudflare-propagation-seconds
+          - '60'
+      changed_when: false
+      no_log: true
+      async: 360
+      poll: 5
+    - name: Detect a new certificate without exposing private keys
+      ansible.builtin.stat:
+        path: "/etc/letsencrypt/live/{{ edge_cert_name }}/fullchain.pem"
+        checksum_algorithm: sha256
+        follow: true
+      register: edge_certificate_after
+      changed_when: edge_certificate_before.stat.checksum | default('') != edge_certificate_after.stat.checksum | default('')
+    - name: Validate the issued public certificate hostname and lifetime
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "/etc/letsencrypt/live/{{ edge_cert_name }}/fullchain.pem", -noout, -checkhost, "{{ external_edge_domain }}", -checkend, '86400']
+      changed_when: false
+    - name: Check ownership of the lineage-scoped renewal hook
+      ansible.builtin.stat:
+        path: "{{ edge_hook_path }}"
+      register: edge_existing_hook
+    - name: Read an existing hook ownership marker
+      ansible.builtin.command:
+        argv: [sed, -n, 2p, "{{ edge_hook_path }}"]
+      register: edge_hook_marker
+      when: edge_existing_hook.stat.exists
+      changed_when: false
+      no_log: true
+    - name: Refuse to overwrite an unrelated renewal hook
+      ansible.builtin.assert:
+        that:
+          - not edge_existing_hook.stat.exists or edge_hook_marker.stdout == '# Managed by vless external-edge; only this certificate triggers nginx reload.'
+    - name: Install a renewal hook limited to this certificate lineage
+      ansible.builtin.template:
+        src: templates/external-edge-renewal.sh.j2
+        dest: "{{ edge_hook_path }}"
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install and validate only this edge vhost
+      block:
+        - name: Render the owned Headscale and subscription vhost
+          ansible.builtin.template:
+            src: templates/external-edge.conf.j2
+            dest: "{{ edge_conf_path }}"
+            owner: root
+            group: root
+            mode: '0644'
+          register: edge_nginx_config
+        - name: Validate nginx before reloading any running service
+          ansible.builtin.command: /usr/sbin/nginx -t
+          changed_when: false
+        - name: Reload nginx gracefully when this edge changed
+          ansible.builtin.systemd_service:
+            name: nginx
+            state: reloaded
+          when: edge_nginx_config.changed or edge_certificate_after.changed
+      rescue:
+        - name: Restore the previous owned vhost when present
+          ansible.builtin.copy:
+            content: "{{ edge_previous_conf.content | b64decode }}"
+            dest: "{{ edge_conf_path }}"
+            mode: '0644'
+          when: edge_existing_conf.stat.exists
+          no_log: true
+        - name: Remove the new vhost after a failed validation
+          ansible.builtin.file:
+            path: "{{ edge_conf_path }}"
+            state: absent
+          when: not edge_existing_conf.stat.exists
+        - name: Validate the restored nginx configuration
+          ansible.builtin.command: /usr/sbin/nginx -t
+          changed_when: false
+        - name: Report the failed edge activation
+          ansible.builtin.fail:
+            msg: Edge activation failed; previous nginx configuration was restored. DNS/certificate remain available for retry.
+    - name: Add an explicitly authorized SNI route on an existing stream frontend
+      vless_nginx_sni_route:
+        path: "{{ external_edge_stream_config }}"
+        container: "{{ external_edge_stream_container }}"
+        map_variable: "{{ external_edge_stream_map }}"
+        hostname: "{{ external_edge_domain }}"
+        backend: "{{ external_edge_stream_backend | default('127.0.0.1:443') }}"
+      when: external_edge_stream_config is defined
+      register: edge_stream_route
+      no_log: true
+    - name: Capture post-change workload identities and nginx metadata
+      vless_edge_audit:
+      register: edge_after
+      no_log: true
+    - name: Preserve post-change audit and DNS status privately
+      ansible.builtin.copy:
+        content: "{{ {'audit': edge_after.audit, 'dns_changed': edge_dns.changed, 'record': edge_dns.record} | to_nice_json }}"
+        dest: "{{ edge_audit_dir }}/edge-result.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+    - name: Require existing workloads and unrelated vhosts to remain unchanged
+      ansible.builtin.assert:
+        that:
+          - edge_before.audit.containers.keys() | difference(edge_after.audit.containers.keys()) | length == 0
+          - edge_before.audit.nginx_master_pid == edge_after.audit.nginx_master_pid
+        fail_msg: Existing workload or unrelated nginx metadata changed; inspect private audit before continuing.
+      no_log: true
+    - name: Require every pre-existing container identity to remain unchanged
+      ansible.builtin.assert:
+        that:
+          - edge_after.audit.containers[item.key].id == item.value.id
+      loop: "{{ edge_before.audit.containers | dict2items }}"
+      no_log: true
+    - name: Require pre-existing running workloads to keep their processes
+      ansible.builtin.assert:
+        that:
+          - edge_after.audit.containers[item.key].pid == item.value.pid
+          - edge_after.audit.containers[item.key].started == item.value.started
+      loop: "{{ edge_before.audit.containers | dict2items }}"
+      when: item.value.status == 'running' and item.value.pid | int > 0
+      no_log: true
+    - name: Require unrelated certificate files to remain unchanged
+      ansible.builtin.assert:
+        that:
+          - edge_after.audit.certificate_hashes[item.key] == item.value
+      loop: "{{ edge_before.audit.certificate_hashes | dict2items }}"
+      when: item.key != '/etc/letsencrypt/live/' + edge_cert_name + '/fullchain.pem'
+      no_log: true
+    - name: Require unrelated nginx configuration files to remain unchanged
+      ansible.builtin.assert:
+        that:
+          - edge_after.audit.nginx_configs[item.key] == item.value
+      loop: "{{ edge_before.audit.nginx_configs | dict2items }}"
+      when: item.key != edge_conf_path
+      no_log: true

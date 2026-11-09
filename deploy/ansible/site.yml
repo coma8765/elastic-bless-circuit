@@ -12,7 +12,7 @@
       ansible.builtin.include_tasks: tasks/controller.yml
       run_once: true
 
-- name: Prepare Podman hosts and images
+- name: Prepare container hosts and images
   hosts: headscale:control:exits:ingress
   gather_facts: true
   # Local inventory maps several logical services to one physical machine.

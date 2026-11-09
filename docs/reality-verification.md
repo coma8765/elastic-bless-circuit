@@ -1,0 +1,61 @@
+# REALITY configuration and subscription verification
+
+Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The current 28-contract renderer suite and isolated panel tests passed locally on ARM64. The earlier 27-contract suite also passed against the rebuilt amd64 Docker image on a managed server through Ansible. Renderer tests use disposable containers, and panel integration uses a fresh isolated database. The original local fixtures were temporarily stopped to free compile memory, then restored with their original container identities and both authenticated routes reverified; the expanded local deployment remained running.
+
+| Suite | Passed | Scope |
+| --- | ---: | --- |
+| `tests/validate.py` | 28 | Compiled ARM64 image: C++ renderer, REALITY key-file substitution, Vision flow, YAML mesh UDP port bounds, input rejection and real `xray run -test` |
+| `tests/ansible_modules.py` | 16 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI validation and mixed-profile rejection |
+| `tests/reality_keys.py` | 11 | Persistent X25519 identities, private-file permissions, concurrent publication and key-pair consistency |
+| `tests/edge_modules.py` | 14 | Owned edge-route updates, quoted/multiline/case-insensitive hostname collision rejection, check mode and rollback |
+| `tests/reality_panel.py` | 7 | Actual 3x-ui APIs and generated subscriptions, account/ingress growth, migration, idempotence and cleanup |
+| `tests/build_staging.py` | 1 | Three roles sharing one host: initial build, unchanged reruns, source/image upgrades and missing-image recovery |
+| `tests/container_overrides.py` | 2 engines | Actual Podman and Docker: DNS/hosts addition, removal and unchanged reruns using disposable containers |
+
+The isolated panel integration verified:
+
+1. Check mode creates no directory or account.
+2. REALITY subscriptions contain the expected Vision flow, client key, short ID, SNI and fingerprint.
+3. Adding an account preserves an existing account's UUID and subscription ID.
+4. Adding an ingress with a different key attaches existing accounts, advertises both profiles, and preserves the first directory's ID/private key.
+5. Removing an owned ingress retires only its subscription profile.
+6. Migration back to TLS produces TLS links without stale REALITY parameters; unchanged reruns report no changes.
+7. The uniquely named test container and private database volume are removed.
+
+Reproduce from the repository root after installing the deployment's pinned Ansible requirements:
+
+```sh
+CONTAINER_ENGINE=podman BUILD_IMAGES='node control' ./scripts/build.sh
+python3 tests/validate.py
+.local/ansible-venv/bin/python tests/ansible_modules.py
+.local/ansible-venv/bin/python tests/reality_keys.py
+.local/ansible-venv/bin/python tests/edge_modules.py
+.local/ansible-venv/bin/python tests/build_staging.py
+.local/ansible-venv/bin/python tests/reality_panel.py
+.local/ansible-venv/bin/python tests/container_overrides.py --engine podman
+```
+
+To use an already built test image, set `NODE_IMAGE` for the renderer suite or pass `--image` to the panel suite. The latter also accepts `--engine docker` for a local Docker daemon. It publishes only random loopback ports, generates all credentials in memory, and does not read credentials from existing deployments.
+
+The override regression requires the Debian stable-slim image to be present and creates one uniquely labeled sleeping container without ports or volumes. Use `--engine docker` for a local Docker daemon, or additionally supply `--ssh-target user@host` and optionally `--ssh-port` for an explicitly selected Docker host. It verifies the real resolver/hosts files and container identity, then removes only its owned fixture. Both engines passed during PR review.
+
+The fast quality CI runs REALITY identity, edge-module and shared-host build contracts. The real container/panel integration runs only in the manually dispatched integration workflow, where Ansible dependencies and built images are available. Raw integration logs and generated credentials are not uploaded.
+
+This evidence proves configuration acceptance and real subscription/control behavior. The isolated panel suite does not authenticate a REALITY data-plane session to the camouflage target, test external firewall/NAT rules, or prove target compatibility. Those require a separate client-to-ingress-to-exit traffic test against the actual deployment. Default TLS behavior remains covered by the same renderer tests and the panel suite's TLS migration case.
+
+For Docker-based renderer checks, use `CONTAINER_ENGINE=docker NODE_IMAGE=localhost/vless-node:dev python3 tests/validate.py`. The mesh-port CLI tests include the default control configuration, valid boundaries and malformed/out-of-range values.
+
+The earlier amd64 Docker run completed all 27 tests in 34.234 seconds, including both new mesh UDP port contracts. Its private Ansible execution log is `.local/live/renderer-docker.log`. The verified rebuilt node image was subsequently transferred to the exit host; no generated credentials or server addresses are included in this report. The subsequent PR review build passed with `-Werror` and `_FORTIFY_SOURCE=2`; its validation records are under `.local/pr-validation`. These review fixes have not been redeployed to the live services.
+
+## Live Docker rollout
+
+A separate two-host Docker deployment was exercised through Ansible with a public Headscale HTTPS endpoint, control and ingress sharing a LAN host, and an exit behind provider NAT. The live inventory, account credentials, certificate material and raw results remain in ignored private state.
+
+- Cloudflare DNS-only record, trusted certificate and a narrowly scoped nginx SNI route were verified from outside the LAN. Existing nginx routes, certificates and running workload identities were preserved.
+- The client imported the actual 3x-ui subscription with REALITY, Vision and its configured SNI. Two independent HTTPS IP checks returned the configured exit's public address; an unknown UUID was rejected.
+- Removing mesh UDP publications was tested against running Docker containers. Docker's default comparison retains extra published ports, so the deployment explicitly compares `published_ports` strictly. Inspection confirmed no managed mesh UDP bindings and no published ports on the exit container; VLESS still worked afterward.
+- Ingress-to-control communication used a direct local Docker-network path. Ingress-to-exit traffic used the encrypted DERP fallback through outbound connections, requiring no provider-side inbound UDP forwarding. A direct Internet path is not claimed.
+- The final unchanged Ansible run reported `changed=0` and `failed=0` for all four logical hosts; container IDs, PIDs and start times were preserved. All mesh nodes remained healthy. The edge playbook also passed an unchanged rerun.
+- A live host reboot was not performed because the hosts also run existing services.
+
+Private evidence is under `.local/live/`: `traffic-report.json`, `mesh-report.json`, `renderer-docker.log`, and the edge/deployment Ansible logs. These artifacts are excluded from publication.

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Managed by vless external-edge; only this certificate triggers nginx reload.
+set -eu
+if [ "${RENEWED_LINEAGE:-}" != "/etc/letsencrypt/live/{{ edge_cert_name }}" ]; then
+    exit 0
+fi
+/usr/sbin/nginx -t
+/bin/systemctl reload nginx

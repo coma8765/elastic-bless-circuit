@@ -1,0 +1,20 @@
+- name: Start the HTTPS subscription gateway
+  containers.podman.podman_container:
+    name: '{{ deployment_id }}-gateway'
+    image: '{{ gateway_image }}'
+    state: started
+    restart_policy: always
+    recreate: '{{ gateway_config.changed or gateway_certs.changed }}'
+    network: '{{ container_network }}'
+    publish: '{{ gateway_publish }}'
+    security_opt:
+    - label=disable
+    - no-new-privileges
+    volume:
+    - '{{ (node_dir | realpath) + ''/gateway.conf:/etc/nginx/conf.d/subscription.conf:ro'' }}'
+    - '{{ (node_dir | realpath) + ''/secrets/subscription-cert.pem:/etc/nginx/cert.pem:ro'' }}'
+    - '{{ (node_dir | realpath) + ''/secrets/subscription-key.pem:/etc/nginx/key.pem:ro'' }}'
+    label:
+      io.vless.deployment: '{{ deployment_id }}'
+    dns: '{{ container_dns_servers }}'
+    etc_hosts: '{{ container_extra_hosts }}'

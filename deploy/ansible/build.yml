@@ -1,7 +1,7 @@
 ---
 # Optional image preparation without enrolling nodes or changing running services.
 # site.yml also performs this stage when build_images is true.
-- name: Prepare images and Podman hosts
+- name: Prepare container images and runtime hosts
   hosts: headscale:control:exits:ingress
   gather_facts: true
   serial: 1
