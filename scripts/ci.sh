@@ -24,3 +24,4 @@ for ci_inventory in inventory.local.yml inventory.example.yml; do
   done
 done
 ./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/external-edge.yml
+./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/ingress-edge.yml

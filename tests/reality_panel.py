@@ -173,6 +173,28 @@ def run(engine, image):
         verify_entries([alice], [ingress_a])
         checks.append('public HTTPS subscription metadata persists without panel restart or identity/profile changes')
 
+        alias = {'address': 'public-alias.example.com', 'port': 8443, 'remark': 'public'}
+        ingress_a['aliases'] = [alias]
+        aliased = reconcile()
+        assert aliased['changed'] and aliased['inbound_ids'] == created['inbound_ids']
+        assert not reconcile()['changed'], 'alias addition rerun was not idempotent'
+        expected_alias = dict(ingress_a, address=alias['address'], port=alias['port'])
+        verify_entries([alice], [ingress_a, expected_alias])
+        links = subscription(alice)
+        assert len(links) == 2 and {(link.hostname, link.port) for link in links} == {
+            (ingress_a['address'], ingress_a['port']), (alias['address'], alias['port'])}
+        assert account_state() == before_accounts, 'alias addition changed UUID, subscription ID or membership'
+        directories = client.call('/panel/api/inbounds/list')
+        assert len(directories) == 1 and directories[0]['id'] == first_id
+        assert directories[0]['streamSettings']['realitySettings']['privateKey'] == first_key
+        checks.append('adding an advertised alias emits two same-key profiles without changing directory or user identities')
+        ingress_a['aliases'] = []
+        assert reconcile()['changed'] and not reconcile()['changed'], 'alias removal was not idempotent'
+        verify_entries([alice], [ingress_a])
+        assert account_state() == before_accounts
+        assert client.call('/panel/api/inbounds/get/' + str(first_id))['streamSettings']['realitySettings']['privateKey'] == first_key
+        checks.append('removing an alias retires only its advertised link and retains the physical ingress')
+
         original = copy.deepcopy(alice)
         module.params['users'].append(bob)
         assert reconcile()['changed'] and not reconcile()['changed']
@@ -204,6 +226,24 @@ def run(engine, image):
             query = urllib.parse.parse_qs(links[0].query)
             assert query.get('security') == ['tls'] and 'pbk' not in query and 'flow' not in query
         checks.append('the original TLS mode remains compatible after owned-profile migration')
+        tls = module.params['ingress_endpoints'][0]
+        tls['aliases'] = [{'address': 'tls-alias.example.com', 'port': 8443, 'remark': 'public'}]
+        before_tls_accounts = account_state()
+        tls_ids = reconcile()['inbound_ids']
+        assert not reconcile()['changed']
+        for record in [alice, bob]:
+            links = wait(lambda: subscription(record))
+            assert len(links) == 2 and {(link.hostname, link.port) for link in links} == {
+                ('tls.example.com', 443), ('tls-alias.example.com', 8443)}
+            for link in links:
+                query = urllib.parse.parse_qs(link.query)
+                assert query.get('security') == ['tls'] and query.get('sni') == ['tls.example.com']
+                assert 'pbk' not in query and 'flow' not in query
+        assert account_state() == before_tls_accounts
+        tls['aliases'] = []
+        assert reconcile()['inbound_ids'] == tls_ids and not reconcile()['changed']
+        assert all(len(subscription(record)) == 1 for record in [alice, bob])
+        checks.append('TLS aliases inherit the primary SNI and retain the same directory and user memberships')
         for check in checks:
             print('PASS ' + check, flush=True)
         return checks

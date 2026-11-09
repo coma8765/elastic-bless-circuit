@@ -48,6 +48,7 @@ ingress_reality_server_name: www.microsoft.com
 ingress_reality_fingerprint: chrome
 ingress_port: 443
 ingress_public_port: 443
+ingress_advertised_aliases: []
 ingress_publish: ["443:443/tcp"]
 transit_port: 8443
 allow_private_destinations: false

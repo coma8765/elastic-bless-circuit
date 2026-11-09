@@ -227,6 +227,51 @@ class PanelPreflight(unittest.TestCase):
         panel.validate(params)
         self.assertNotIn('subscription_public_url', params)
 
+    def test_aliases_inherit_the_physical_tls_or_reality_profile(self):
+        for fixture in [self.fixture, self.reality_fixture]:
+            params = fixture()
+            endpoint = params['ingress_endpoints'][0]
+            endpoint['aliases'] = [{'address': 'public.example.com', 'port': 8443, 'remark': 'public'}]
+            primary = panel.validate(params)[0]
+            proxies = panel.endpoint_proxies(endpoint, primary)
+            self.assertEqual(proxies[0], primary)
+            self.assertEqual(proxies[1], dict(primary, dest='public.example.com', port=8443, remark='public'))
+            if endpoint['security'] == 'reality':
+                stream = panel.directory_stream(endpoint, primary)
+                self.assertEqual(stream['externalProxy'], proxies)
+                self.assertEqual(stream['realitySettings']['settings']['publicKey'], endpoint['reality_public_key'])
+
+    def test_aliases_reject_collisions_and_invalid_labels_or_addresses(self):
+        for override in [{'address': 'bad/path'}, {'port': 0}, {'port': 65536},
+                         {'remark': ''}, {'remark': 'x' * 65}, {'remark': 'bad label'},
+                         {'security': 'none'}]:
+            params = self.reality_fixture()
+            alias = dict(address='public.example.com', port=443, remark='public')
+            alias.update(override)
+            params['ingress_endpoints'][0]['aliases'] = [alias]
+            with self.subTest(override=override), self.assertRaises(panel.PanelError):
+                panel.validate(params)
+        params = self.reality_fixture()
+        first = params['ingress_endpoints'][0]
+        first['aliases'] = [{'address': first['address'].upper(), 'port': first['port'], 'remark': 'public'}]
+        with self.assertRaisesRegex(panel.PanelError, 'unique'):
+            panel.validate(params)
+        for same_label in [True, False]:
+            params = self.reality_fixture()
+            first = params['ingress_endpoints'][0]
+            first['aliases'] = [{'address': 'public.example.com', 'port': 443, 'remark': 'public'},
+                                {'address': 'other.example.com' if same_label else 'PUBLIC.example.com',
+                                 'port': 443, 'remark': 'public' if same_label else 'other'}]
+            with self.subTest(same_label=same_label), self.assertRaisesRegex(panel.PanelError, 'unique'):
+                panel.validate(params)
+        params = self.reality_fixture()
+        params['ingress_endpoints'][0]['aliases'] = [{'address': 'public.example.com', 'port': 443, 'remark': 'public'}]
+        second = copy.deepcopy(params['ingress_endpoints'][0])
+        second.update(address='public.example.com', remark='second', aliases=[])
+        params['ingress_endpoints'].append(second)
+        with self.assertRaisesRegex(panel.PanelError, 'unique'):
+            panel.validate(params)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -1,0 +1,116 @@
+---
+# Publish a REALITY dial hostname through an existing TCP/SNI frontend.
+# DNS destination and ClientHello SNI are deliberately separate inputs.
+- name: Configure an explicitly scoped REALITY ingress passthrough
+  hosts: ingress_edge
+  gather_facts: false
+  become: true
+  vars:
+    ingress_audit_dir: "{{ ingress_edge_audit_dir | default(playbook_dir + '/../../.local/ingress-edge') }}"
+  tasks:
+    - name: Validate the explicit ingress edge scope
+      ansible.builtin.assert:
+        that:
+          - ingress_edge_domain is match('^[a-z0-9][a-z0-9.-]+[a-z0-9]$')
+          - ingress_edge_zone is match('^[a-z0-9][a-z0-9.-]+[a-z0-9]$')
+          - ingress_edge_ipv4 is match('^[0-9.]+$')
+          - not ansible_check_mode
+        fail_msg: Supply the dial domain, zone, address and authorized frontend in a private inventory.
+    - name: Validate the existing host nginx configuration
+      ansible.builtin.command: /usr/sbin/nginx -t
+      changed_when: false
+    - name: Validate the requested route without changing its file or reloading
+      vless_nginx_sni_route:
+        path: "{{ ingress_edge_stream_config }}"
+        container: "{{ ingress_edge_stream_container }}"
+        map_variable: "{{ ingress_edge_stream_map }}"
+        hostname: "{{ ingress_edge_sni }}"
+        backend: "{{ ingress_edge_backend }}"
+        allow_private_backend: "{{ ingress_edge_allow_private_backend | default(false) | bool }}"
+      check_mode: true
+      changed_when: false
+      no_log: true
+    - name: Validate the existing stream nginx configuration
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ ingress_edge_stream_container }}", nginx, -t]
+      changed_when: false
+    - name: Capture existing workload and nginx identities before mutation
+      vless_edge_audit:
+      register: ingress_edge_before
+      no_log: true
+    - name: Require the selected frontend to be a running existing container
+      ansible.builtin.assert:
+        that:
+          - ('/' + ingress_edge_stream_container) in ingress_edge_before.audit.containers
+          - ingress_edge_before.audit.containers['/' + ingress_edge_stream_container].status == 'running'
+        fail_msg: The selected existing stream frontend is not running.
+      no_log: true
+    - name: Prepare the private controller audit directory
+      ansible.builtin.file:
+        path: "{{ ingress_audit_dir }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+    - name: Preserve the ingress edge baseline privately
+      ansible.builtin.copy:
+        content: "{{ ingress_edge_before.audit | to_nice_json }}"
+        dest: "{{ ingress_audit_dir }}/ingress-edge-baseline.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+    - name: Reconcile only the authorized dial-hostname DNS record
+      vless_cloudflare_record:
+        zone: "{{ ingress_edge_zone }}"
+        name: "{{ ingress_edge_domain }}"
+        ipv4: "{{ ingress_edge_ipv4 }}"
+        credentials_file: "{{ ingress_edge_cf_credentials }}"
+      register: ingress_edge_dns
+      no_log: true
+    - name: Add only the authorized REALITY SNI passthrough route
+      vless_nginx_sni_route:
+        path: "{{ ingress_edge_stream_config }}"
+        container: "{{ ingress_edge_stream_container }}"
+        map_variable: "{{ ingress_edge_stream_map }}"
+        hostname: "{{ ingress_edge_sni }}"
+        backend: "{{ ingress_edge_backend }}"
+        allow_private_backend: "{{ ingress_edge_allow_private_backend | default(false) | bool }}"
+      register: ingress_edge_route
+      no_log: true
+    - name: Capture post-change workload and nginx identities
+      vless_edge_audit:
+      register: ingress_edge_after
+      no_log: true
+    - name: Preserve the ingress edge result privately
+      ansible.builtin.copy:
+        content: "{{ {'audit': ingress_edge_after.audit, 'dns_changed': ingress_edge_dns.changed, 'route_changed': ingress_edge_route.changed} | to_nice_json }}"
+        dest: "{{ ingress_audit_dir }}/ingress-edge-result.json"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+    - name: Require existing host nginx configuration and certificates to stay unchanged
+      ansible.builtin.assert:
+        that:
+          - ingress_edge_before.audit.nginx_master_pid == ingress_edge_after.audit.nginx_master_pid
+          - ingress_edge_before.audit.nginx_configs == ingress_edge_after.audit.nginx_configs
+          - ingress_edge_before.audit.certificate_hashes == ingress_edge_after.audit.certificate_hashes
+          - ingress_edge_before.audit.containers.keys() | difference(ingress_edge_after.audit.containers.keys()) | length == 0
+      no_log: true
+    - name: Require every existing container identity to stay unchanged
+      ansible.builtin.assert:
+        that:
+          - ingress_edge_after.audit.containers[item.key].id == item.value.id
+      loop: "{{ ingress_edge_before.audit.containers | dict2items }}"
+      no_log: true
+    - name: Require running workloads and the frontend master to keep their processes
+      ansible.builtin.assert:
+        that:
+          - ingress_edge_after.audit.containers[item.key].pid == item.value.pid
+          - ingress_edge_after.audit.containers[item.key].started == item.value.started
+      loop: "{{ ingress_edge_before.audit.containers | dict2items }}"
+      when: item.value.status == 'running' and item.value.pid | int > 0
+      no_log: true

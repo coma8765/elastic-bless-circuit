@@ -5,10 +5,10 @@ Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The curren
 | Suite | Passed | Scope |
 | --- | ---: | --- |
 | `tests/validate.py` | 28 | Compiled ARM64 image: C++ renderer, REALITY key-file substitution, Vision flow, YAML mesh UDP port bounds, input rejection and real `xray run -test` |
-| `tests/ansible_modules.py` | 17 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI/public-origin validation and mixed-profile rejection |
+| `tests/ansible_modules.py` | 19 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI/public-origin validation, alias inheritance/collision checks and mixed-profile rejection |
 | `tests/reality_keys.py` | 11 | Persistent X25519 identities, private-file permissions, concurrent publication and key-pair consistency |
-| `tests/edge_modules.py` | 21 | Owned edge routes, hostname collision rejection, subscription-only routing, separate certificate/hook ownership, check mode and rollback |
-| `tests/reality_panel.py` | 8 | Actual 3x-ui APIs and generated subscriptions, public URL persistence without restart/identity changes, account/ingress growth, migration, idempotence and cleanup |
+| `tests/edge_modules.py` | 30 | Owned edge routes, quoted/case-insensitive SNI collision rejection, RFC1918 backend opt-in, subscription-only routing, separate certificate/hook ownership, check mode and rollback |
+| `tests/reality_panel.py` | 11 | Actual 3x-ui APIs and generated subscriptions, public URL persistence without restart/identity changes, alias/account/ingress growth, migration, idempotence and cleanup |
 | `tests/build_staging.py` | 1 | Three roles sharing one host: initial build, unchanged reruns, source/image upgrades and missing-image recovery |
 | `tests/container_overrides.py` | 2 engines | Actual Podman and Docker: DNS/hosts addition, removal and unchanged reruns using disposable containers |
 
@@ -17,11 +17,14 @@ The isolated panel integration verified:
 1. Check mode creates no directory or account.
 2. REALITY subscriptions contain the expected Vision flow, client key, short ID, SNI and fingerprint.
 3. A public HTTPS subscription prefix persists across API sessions without a panel restart; unchanged and omitted-value reruns preserve the URL, accounts and directory identities.
-4. Adding an account preserves an existing account's UUID and subscription ID.
-5. Adding an ingress with a different key attaches existing accounts, advertises both profiles, and preserves the first directory's ID/private key.
-6. Removing an owned ingress retires only its subscription profile.
-7. Migration back to TLS produces TLS links without stale REALITY parameters; unchanged reruns report no changes.
-8. The uniquely named test container and private database volume are removed.
+4. Adding an alias emits two REALITY links with the same UUID, key, short ID, SNI and fingerprint, retaining the existing directory and memberships; unchanged reruns report no changes.
+5. Removing an alias retires only its advertised link and preserves the physical ingress and its identities.
+6. Adding an account preserves an existing account's UUID and subscription ID.
+7. Adding an ingress with a different key attaches existing accounts, advertises both profiles, and preserves the first directory's ID/private key.
+8. Removing an owned ingress retires only its subscription profile.
+9. Migration back to TLS produces TLS links without stale REALITY parameters; unchanged reruns report no changes.
+10. TLS aliases inherit the primary SNI and preserve directory identities and user memberships through addition/removal.
+11. The uniquely named test container and private database volume are removed.
 
 Reproduce from the repository root after installing the deployment's pinned Ansible requirements:
 

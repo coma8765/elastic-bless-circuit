@@ -108,12 +108,12 @@
   no_log: true
 - name: Assemble public TLS ingress endpoints
   ansible.builtin.set_fact:
-    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, aliases=hostvars[item].ingress_advertised_aliases, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
   loop: "{{ groups.ingress }}"
   when: hostvars[item].ingress_security == 'tls'
 - name: Assemble public REALITY ingress endpoints
   ansible.builtin.set_fact:
-    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint)] }}"
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, aliases=hostvars[item].ingress_advertised_aliases, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint)] }}"
   loop: "{{ groups.ingress }}"
   when: hostvars[item].ingress_security == 'reality'
   no_log: true

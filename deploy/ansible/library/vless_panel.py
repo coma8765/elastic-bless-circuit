@@ -57,6 +57,7 @@ options:
     description: Optional HTTPS origin for advertised subscription links; omission preserves the current override.
     type: str
 notes:
+  - Each ingress endpoint may include aliases containing address, port and remark; aliases inherit its security profile and use the same directory.
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
   - Removed managed clients are disabled globally but remain in the panel for audit.
@@ -202,12 +203,26 @@ def validate(params):
     profile_names = set()
     for endpoint in params["ingress_endpoints"]:
         address = endpoint["address"]
-        if not address or any(ch in address for ch in "/?#@\r\n\t "):
-            raise PanelError("endpoint address must be a hostname or bare IP address")
-        key = (address, valid_port(endpoint["port"]))
-        if key in endpoint_keys:
-            raise PanelError("public ingress endpoints must be unique")
-        endpoint_keys.add(key)
+        aliases = endpoint.get("aliases") or []
+        if not isinstance(aliases, list):
+            raise PanelError("endpoint aliases must be a list")
+        alias_labels = set()
+        for alias in aliases:
+            if not isinstance(alias, dict) or set(alias) != {"address", "port", "remark"}:
+                raise PanelError("aliases require only address, port and remark")
+            label = alias["remark"]
+            if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label) or label in alias_labels or label == endpoint.get("remark"):
+                raise PanelError("aliases require unique bounded labels in remark")
+            alias_labels.add(label)
+        for advertised in [endpoint] + aliases:
+            host = advertised["address"]
+            if not isinstance(host, str) or not (valid_dns_name(host) or is_ip_literal(host)):
+                raise PanelError("endpoint address must be a hostname or bare IP address")
+            canonical = str(ipaddress.ip_address(host)) if is_ip_literal(host) else host.lower()
+            key = (canonical, valid_port(advertised["port"]))
+            if key in endpoint_keys:
+                raise PanelError("public ingress endpoints and aliases must be unique")
+            endpoint_keys.add(key)
         if reality_mode:
             name = endpoint.get("remark", "")
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name) or name in profile_names:
@@ -287,13 +302,19 @@ def owned_directory(inbound):
     return remark == DIRECTORY or remark.startswith(DIRECTORY + ":")
 
 
+def endpoint_proxies(endpoint, primary):
+    """Aliases inherit the physical ingress security profile unchanged."""
+    return [primary] + [dict(primary, dest=alias["address"], port=alias["port"], remark=alias["remark"])
+                        for alias in (endpoint.get("aliases") or [])]
+
+
 def directory_stream(endpoint, proxy, existing=None):
     """Keep real ingress private keys out of the control database entirely."""
     settings = object_value((existing or {}).get("streamSettings", {})).get("realitySettings", {})
     private_key = settings.get("privateKey")
     if not isinstance(private_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", private_key):
         private_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
-    return {"network": "tcp", "security": "reality", "externalProxy": [proxy],
+    return {"network": "tcp", "security": "reality", "externalProxy": endpoint_proxies(endpoint, proxy),
             "realitySettings": {"show": False, "target": endpoint["reality_target"], "xver": 0,
                                 "serverNames": [endpoint["reality_server_name"]],
                                 "privateKey": private_key, "shortIds": [endpoint["reality_short_id"]],
@@ -359,7 +380,9 @@ def reconcile(module, panel, proxies):
                 valid_port(listen_port)
         used_ports.add(listen_port)
         stream = directory_stream(endpoint, proxies[index], existing) if reality_mode else {
-            "network": "tcp", "security": "none", "externalProxy": proxies}
+            "network": "tcp", "security": "none", "externalProxy": [
+                advertised for physical, primary in zip(params["ingress_endpoints"], proxies)
+                for advertised in endpoint_proxies(physical, primary)]}
         desired = {"remark": remark, "listen": "127.0.0.1", "port": listen_port,
                    "protocol": "vless", "streamSettings": stream, "disableFlow": False,
                    "sniffing": {"enabled": False}, "expiryTime": 0, "total": 0,
@@ -484,6 +507,10 @@ def main():
             "address": {"type": "str", "required": True},
             "port": {"type": "int", "required": True},
             "remark": {"type": "str", "default": ""},
+            "aliases": {"type": "list", "elements": "dict", "default": [], "options": {
+                "address": {"type": "str", "required": True},
+                "port": {"type": "int", "required": True},
+                "remark": {"type": "str", "required": True}}},
             "security": {"type": "str", "default": "tls", "choices": ["tls", "reality"]},
             "tls_server_name": {"type": "str"},
             "reality_server_name": {"type": "str"},

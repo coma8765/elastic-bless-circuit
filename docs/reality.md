@@ -31,6 +31,17 @@ The module returns `inbound_ids` keyed by stable ingress inventory names (`remar
 
 Set the Ansible inventory's `subscription_public_url` to the public HTTPS origin, such as `https://subscriptions.example.com`, when hosting subscriptions behind a reverse proxy. The control role passes it to the panel module, which persists the complete `subURI` prefix ending in `/sub/`. Existing subscription IDs and VLESS node profiles remain unchanged. A metadata-only URL update does not restart the panel; omitting the module argument preserves a manually configured override. The reverse proxy should expose `/sub/` only, with the admin UI and API remaining private. JSON and Clash subscription paths are separate formats and are not enabled or published by this setting.
 
+To advertise another address for the same physical ingress, keep its primary address and add host-level YAML aliases:
+
+```yaml
+ingress_advertised_aliases:
+  - address: public-ingress.example.com
+    port: 443
+    remark: public
+```
+
+The default is an empty list. Aliases add subscription links to the existing directory; they retain its inbound ID, user memberships, UUIDs and REALITY keys. Removing an alias removes only its advertised link. Each address/port pair must be unique across primaries and aliases; alias remarks must be distinct labels of at most 64 letters, digits, dots, underscores or hyphens, starting with a letter or digit. An alias inherits the physical ingress's TLS SNI or REALITY SNI, fingerprint, public key and short ID. It does not create a node, listener, DNS record or proxy route. Configure those separately. For REALITY SNI passthrough, route the camouflage SNI (for example `www.microsoft.com`) to the physical ingress; the dial hostname in the alias does not replace that SNI.
+
 REALITY is not a guarantee of undetectability. Unauthenticated connections are forwarded to the configured target, which creates a port-forwarding surface. Choose targets deliberately and account for their network policy and capacity. Target reachability and compatibility are operational dependencies; `xray run -test` checks configuration syntax, not the live target's behavior. User or profile changes may restart Xray and interrupt active sessions, as with the existing TLS profile.
 
 Official field definitions: [Project X REALITY configuration](https://xtls.github.io/en/config/transports/reality.html) and [3x-ui REALITY documentation](https://github.com/MHSanaei/3x-ui/blob/v3.11.0/docs/content/docs/en/config/reality.mdx).

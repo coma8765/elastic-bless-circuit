@@ -133,6 +133,30 @@ class RouteSafety(unittest.TestCase):
         self.assertEqual(result['content'], content)
         self.assertIsNone(result['backup'])
 
+    def test_equivalent_exact_keys_are_idempotent_or_refused_without_writes(self):
+        for key in ['NEW.EXAMPLE.TEST', '"new.example.test"', "'NEW.EXAMPLE.TEST'"]:
+            for layout in ['  {key} {backend};\n', '  {key}\n    # retained comment\n    "{backend}"\n    ;\n']:
+                for backend in ['127.0.0.1:443', '127.0.0.1:9999']:
+                    for check in [False, True]:
+                        with self.subTest(key=key, layout=layout, backend=backend, check=check):
+                            entry = layout.format(key=key, backend=backend)
+                            content = CONFIG.replace('  default 127.0.0.1:4089;', entry + '  default 127.0.0.1:4089;')
+                            result = self.execute(content, check=check)
+                            self.assertEqual(result['failed'], backend != '127.0.0.1:443')
+                            if not result['failed']:
+                                self.assertFalse(result['result']['changed'])
+                            self.assertEqual(result['content'], content)
+                            self.assertIsNone(result['backup'])
+                            self.assertFalse(any(c[1] == 'exec' for c in result['calls']))
+
+    def test_duplicate_case_and_quote_variants_fail_closed(self):
+        content = CONFIG.replace('  default 127.0.0.1:4089;',
+                                 ADDITION + '  "NEW.EXAMPLE.TEST" 127.0.0.1:443;\n  default 127.0.0.1:4089;')
+        result = self.execute(content, check=True)
+        self.assertTrue(result['failed'])
+        self.assertEqual(result['content'], content)
+        self.assertIsNone(result['backup'])
+
     def test_an_identical_hostname_in_another_map_is_preserved(self):
         content = CONFIG.replace('reserved.example.test', 'new.example.test')
         result = self.execute(content)
@@ -166,6 +190,49 @@ class RouteSafety(unittest.TestCase):
                 result = self.execute(overrides=params)
                 self.assertTrue(result['failed'])
                 self.assertEqual(result['content'], CONFIG)
+                self.assertEqual(result['calls'], [])
+
+    def test_rfc1918_backends_require_explicit_opt_in(self):
+        for address in ['10.20.30.40', '172.16.0.1', '172.31.255.254', '192.168.20.30']:
+            with self.subTest(address=address):
+                backend = address + ':4333'
+                rejected = self.execute(overrides={'backend': backend})
+                self.assertTrue(rejected['failed'])
+                self.assertEqual(rejected['calls'], [])
+                allowed = self.execute(overrides={'backend': backend, 'allow_private_backend': True})
+                self.assertFalse(allowed['failed'])
+                self.assertIn('new.example.test ' + backend + ';', allowed['content'])
+                self.assertTrue(allowed['inode_unchanged'])
+                self.assertEqual(allowed['backup'], CONFIG)
+
+    def test_opt_in_never_accepts_public_link_local_multicast_or_cgnat(self):
+        for address in ['8.8.8.8', '192.0.2.1', '203.0.113.1', '169.254.1.1',
+                        '224.0.0.1', '100.64.0.1', '172.15.255.255', '172.32.0.1',
+                        '192.169.0.1', '127.0.0.2', '0.0.0.0', '255.255.255.255']:
+            with self.subTest(address=address):
+                result = self.execute(overrides={'backend': address + ':4333', 'allow_private_backend': True})
+                self.assertTrue(result['failed'])
+                self.assertEqual(result['calls'], [])
+                self.assertEqual(result['content'], CONFIG)
+
+    def test_all_backend_ports_are_validated_before_docker_access(self):
+        for host in ['127.0.0.1', '10.20.30.40']:
+            for port in ['0', '00000', '65536', '99999', '+443', 'https', '655350']:
+                with self.subTest(host=host, port=port):
+                    result = self.execute(overrides={'backend': host + ':' + port, 'allow_private_backend': True})
+                    self.assertTrue(result['failed'])
+                    self.assertEqual(result['calls'], [])
+            for port in ['1', '65535']:
+                with self.subTest(host=host, port=port):
+                    result = self.execute(overrides={'backend': host + ':' + port, 'allow_private_backend': True})
+                    self.assertFalse(result['failed'])
+
+    def test_ipv6_and_malformed_backends_are_not_accepted_by_ipv4_opt_in(self):
+        for backend in ['[::1]:443', '[fd00::1]:4333', '10.20.30.40', '10.20.30.40:4333:1',
+                        '10.020.30.40:4333', '10.20.30.40:4333; injected']:
+            with self.subTest(backend=backend):
+                result = self.execute(overrides={'backend': backend, 'allow_private_backend': True})
+                self.assertTrue(result['failed'])
                 self.assertEqual(result['calls'], [])
 
     def test_check_mode_does_not_write_or_reload(self):
@@ -295,6 +362,34 @@ class EdgeTemplateScope(unittest.TestCase):
         self.assertFalse(expression(**context))
         context['edge_lineage'] = '/etc/letsencrypt/live/second'
         self.assertTrue(expression(**context))
+
+    def test_ingress_dial_domain_is_independent_of_the_routed_reality_sni(self):
+        tasks = yaml.safe_load((ROOT / 'deploy/ansible/ingress-edge.yml').read_text())[0]['tasks']
+        dns = next(task['vless_cloudflare_record'] for task in tasks if 'vless_cloudflare_record' in task)
+        routes = [task['vless_nginx_sni_route'] for task in tasks if 'vless_nginx_sni_route' in task]
+        context = {'ingress_edge_domain': 'dial.example.test', 'ingress_edge_sni': 'cover.example.test'}
+        self.assertEqual(self.env.from_string(dns['name']).render(**context), 'dial.example.test')
+        self.assertEqual(len(routes), 2)
+        for route in routes:
+            self.assertEqual(self.env.from_string(route['hostname']).render(**context), 'cover.example.test')
+
+    def test_ingress_route_preflight_precedes_dns_and_performs_no_reload(self):
+        tasks = yaml.safe_load((ROOT / 'deploy/ansible/ingress-edge.yml').read_text())[0]['tasks']
+        dns_index = next(index for index, task in enumerate(tasks) if 'vless_cloudflare_record' in task)
+        route_tasks = [(index, task) for index, task in enumerate(tasks) if 'vless_nginx_sni_route' in task]
+        self.assertLess(route_tasks[0][0], dns_index)
+        self.assertTrue(route_tasks[0][1]['check_mode'])
+        self.assertFalse(route_tasks[0][1]['changed_when'])
+        self.assertGreater(route_tasks[1][0], dns_index)
+        self.assertNotIn('check_mode', route_tasks[1][1])
+
+    def test_ingress_passthrough_does_not_install_certificates_or_https_vhosts(self):
+        playbook = yaml.safe_load((ROOT / 'deploy/ansible/ingress-edge.yml').read_text())[0]
+        self.assertEqual(playbook['hosts'], 'ingress_edge')
+        self.assertFalse(any('ansible.builtin.template' in task for task in playbook['tasks']))
+        commands = [task['ansible.builtin.command'] for task in playbook['tasks'] if 'ansible.builtin.command' in task]
+        self.assertFalse(any('certbot' in str(command) for command in commands))
+        self.assertFalse(any('state' in task.get('ansible.builtin.systemd_service', {}) for task in playbook['tasks']))
 
     def test_scope_guards_run_before_dns_or_certificate_mutations(self):
         names = [task['name'] for task in self.tasks]
