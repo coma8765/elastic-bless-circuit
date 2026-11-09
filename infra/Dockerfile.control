@@ -1,0 +1,11 @@
+FROM ghcr.io/mhsanaei/3x-ui:v3.11.0 AS panel
+FROM localhost/vless-node:dev
+# Upstream panel is linked against musl; retain its exact runtime on Debian.
+COPY --from=panel /lib/ld-musl-* /lib/
+COPY --from=panel /lib/libc.musl-* /lib/
+COPY --from=panel /app/ /app/
+WORKDIR /app
+ENV XUI_IN_DOCKER=true XUI_MAIN_FOLDER=/app XUI_ENABLE_FAIL2BAN=false
+VOLUME ["/etc/x-ui"]
+EXPOSE 2053 2096
+CMD ["node-agent", "control", "/etc/node/config.yaml"]

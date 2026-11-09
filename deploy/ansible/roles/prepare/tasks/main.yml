@@ -1,0 +1,56 @@
+- name: Require Debian on managed production hosts
+  ansible.builtin.assert:
+    that:
+      - local_mode | bool or ansible_facts.distribution == 'Debian'
+      - local_mode | bool or ansible_facts.user_id == 'root'
+    fail_msg: "Production uses rootful Podman on Debian; run with --become."
+- name: Install the Debian container runtime
+  ansible.builtin.apt:
+    name: [podman, python3, ca-certificates, tar]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: install_packages | bool
+- name: Restore managed containers after host reboot
+  ansible.builtin.systemd_service:
+    name: podman-restart.service
+    enabled: true
+  when: not local_mode | bool
+- name: Create private runtime and build directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0700'
+  loop: ["{{ node_dir }}", "{{ node_dir }}/secrets", "{{ deployment_root }}/build"]
+- name: Copy build inputs without credentials or local artifacts
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/{{ item }}"
+    dest: "{{ deployment_root }}/build/"
+    mode: preserve
+  loop: [CMakeLists.txt, src, infra, scripts]
+  register: build_sources
+  when: build_images | bool
+- name: Inspect required images
+  ansible.builtin.command:
+    argv: [podman, image, exists, "{{ item }}"]
+  loop: "{{ [node_image, control_image, headscale_image, gateway_image] }}"
+  register: existing_images
+  changed_when: false
+  failed_when: false
+- name: Build all deployment images on the target architecture
+  ansible.builtin.command:
+    argv: [sh, "{{ deployment_root }}/build/scripts/build.sh"]
+  when:
+    - build_images | bool
+    - build_sources.changed or (existing_images.results | selectattr('rc', 'ne', 0) | list | length > 0)
+- name: Pull configured images when builds are disabled
+  containers.podman.podman_image:
+    name: "{{ item.item }}"
+    state: present
+  loop: "{{ existing_images.results }}"
+  loop_control: {label: "{{ item.item }}"}
+  when: not build_images | bool and item.rc != 0
+- name: Create the deployment bridge
+  containers.podman.podman_network:
+    name: "{{ podman_network }}"
+    state: present

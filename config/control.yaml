@@ -1,0 +1,10 @@
+mesh:
+  enabled: true
+  server: https://headscale.example.com
+  hostname: control-1
+  auth_key_file: /run/secrets/headscale-key
+panel_settings:
+  username_file: /run/secrets/panel-user
+  password_file: /run/secrets/panel-password
+  port: 2053
+  base_path: /

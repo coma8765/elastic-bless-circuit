@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+FROM docker.io/library/debian:stable-slim AS dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends g++ cmake make libyaml-cpp-dev nlohmann-json3-dev libcurl4-openssl-dev ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
+FROM dependencies AS build
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src ./src
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j2
+FROM dependencies AS downloads
+ARG XRAY_VERSION=26.11.9
+ARG TAILSCALE_VERSION=1.104.5
+COPY infra/download.sh /download.sh
+RUN sh /download.sh
+FROM docker.io/library/debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libyaml-cpp0.8 libcurl4t64 ca-certificates iproute2 iptables tini curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/node-agent /usr/local/bin/
+COPY --from=downloads /opt/bin/ /usr/local/bin/
+COPY --from=downloads /opt/share/ /usr/local/share/xray/
+COPY infra/entrypoint.sh /usr/local/bin/entrypoint
+ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
+VOLUME ["/var/lib/tailscale", "/var/lib/node"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=90s --retries=3 CMD test -f /run/node/ready && test $(($(date +%s) - $(stat -c %Y /run/node/ready))) -lt 10
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint"]
+CMD ["node-agent", "run", "/etc/node/config.yaml"]

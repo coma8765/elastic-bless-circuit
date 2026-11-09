@@ -1,0 +1,35 @@
+role: in
+sync_seconds: 15
+mesh:
+  enabled: true
+  server: https://headscale.example.com
+  hostname: in-eu-1
+  auth_key_file: /run/secrets/headscale-key
+listener:
+  address: 0.0.0.0
+  port: 443
+  stream:
+    network: tcp
+    security: tls
+    tlsSettings:
+      certificates:
+        - certificateFile: /run/secrets/fullchain.pem
+          keyFile: /run/secrets/privkey.pem
+panel:
+  url: https://panel.mesh.example.com
+  username_file: /run/secrets/panel-user
+  password_file: /run/secrets/panel-password
+  inbound_id: 1
+exits:
+  - name: out-eu
+    address: 100.64.0.2
+    port: 8443
+    uuid_file: /run/secrets/out-eu-uuid
+  - name: out-us
+    address: 100.64.0.3
+    port: 8443
+    uuid_file: /run/secrets/out-us-uuid
+# Panel emails are stable identities. Issue a different UUID/email per exit choice.
+routes:
+  alice-eu: out-eu
+  alice-us: out-us

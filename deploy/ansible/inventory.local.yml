@@ -1,0 +1,52 @@
+all:
+  children:
+    vless:
+      vars:
+        ansible_connection: local
+        ansible_remote_tmp: '{{ playbook_dir }}/../../.local/ansible-home/remote'
+        ansible_python_interpreter: '{{ ansible_playbook_python }}'
+        ansible_become: false
+        local_mode: true
+        install_packages: false
+        build_images: false
+        deployment_id: va
+        controller_state_dir: '{{ playbook_dir }}/../../.local/ansible-test/controller'
+        deployment_root: '{{ playbook_dir }}/../../.local/ansible-test/runtime'
+        podman_network: vless-ansible-lab
+        headscale_url: https://va-headscale
+        headscale_publish:
+        - 127.0.0.1:22444:443/tcp
+        headscale_ca_file: '{{ controller_state_dir }}/tls/headscale.crt'
+        panel_host_port: 22053
+        subscription_host_port: 22096
+        subscription_public_url: https://127.0.0.1:22443
+        gateway_publish:
+        - 127.0.0.1:22443:443/tcp
+        mesh_udp_publish: []
+        ingress_port: 443
+        ingress_public_port: 24443
+        ingress_publish:
+        - 127.0.0.1:24443:443/tcp
+        allow_private_destinations: true
+        sync_seconds: 2
+        vless_users:
+        - email: alice-a
+          exit: out-a
+        - email: alice-b
+          exit: out-b
+      children:
+        headscale:
+          hosts:
+            headscale: {}
+        control:
+          hosts:
+            control: {}
+        exits:
+          hosts:
+            out-a: {}
+            out-b: {}
+        ingress:
+          hosts:
+            in:
+              ingress_public_address: 127.0.0.1
+              ingress_server_name: ingress.vless.test

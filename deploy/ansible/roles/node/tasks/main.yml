@@ -1,0 +1,98 @@
+- name: Select exit role when not supplied by caller
+  ansible.builtin.set_fact:
+    node_role: "{{ node_role | default('out') }}"
+- name: Install only this node's mesh enrollment key
+  ansible.builtin.copy:
+    src: "{{ controller_state_dir }}/enrollment/{{ inventory_hostname }}.key"
+    dest: "{{ node_dir }}/secrets/headscale-key"
+    mode: '0600'
+  register: mesh_secret
+  no_log: true
+- name: Install private Headscale CA when configured
+  ansible.builtin.copy:
+    src: "{{ headscale_ca_file }}"
+    dest: "{{ node_dir }}/secrets/headscale-ca.pem"
+    mode: '0600'
+  register: mesh_ca
+  when: headscale_ca_file | length > 0
+- name: Install panel credentials for control and ingress only
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ node_dir }}/secrets/{{ item.name }}"
+    mode: '0600'
+  loop:
+    - {name: panel-user, content: "{{ panel_username }}"}
+    - {name: panel-password, content: "{{ hostvars[groups.headscale[0]].panel_password }}"}
+  when: node_role != 'out'
+  register: panel_secrets
+  no_log: true
+- name: Install the exit's transit identity
+  ansible.builtin.copy:
+    src: "{{ controller_state_dir }}/transit/{{ inventory_hostname }}.uuid"
+    dest: "{{ node_dir }}/secrets/transit-uuid"
+    mode: '0600'
+  when: node_role == 'out'
+  register: transit_secret
+  no_log: true
+- name: Install authorized exit credentials on ingress
+  ansible.builtin.copy:
+    src: "{{ controller_state_dir }}/transit/{{ item }}.uuid"
+    dest: "{{ node_dir }}/secrets/{{ item }}-uuid"
+    mode: '0600'
+  loop: "{{ groups.exits }}"
+  when: node_role == 'in'
+  register: ingress_transit
+  no_log: true
+- name: Install ingress TLS credentials
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ node_dir }}/secrets/{{ item.dest }}"
+    mode: '0600'
+  loop:
+    - {src: "{{ ingress_tls_cert }}", dest: fullchain.pem}
+    - {src: "{{ ingress_tls_key }}", dest: privkey.pem}
+  when: node_role == 'in'
+  register: ingress_certs
+  no_log: true
+- name: Render node YAML
+  ansible.builtin.template:
+    src: node.yaml.j2
+    dest: "{{ node_dir }}/config.yaml"
+    mode: '0600'
+  register: node_config
+- name: Start the supervised mesh service
+  containers.podman.podman_container:
+    name: "{{ container_name }}"
+    image: "{{ control_image if node_role == 'control' else node_image }}"
+    state: started
+    restart_policy: always
+    recreate: "{{ node_config.changed or mesh_secret.changed or mesh_ca.changed or panel_secrets.changed or transit_secret.changed or ingress_transit.changed or ingress_certs.changed }}"
+    network: "{{ podman_network }}"
+    publish: "{{ mesh_udp_publish + (['127.0.0.1:' + (panel_host_port | string) + ':2053/tcp', '127.0.0.1:' + (subscription_host_port | string) + ':2096/tcp'] if node_role == 'control' else (ingress_publish if node_role == 'in' else [])) }}"
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, NET_BIND_SERVICE, SETUID, SETGID, CHOWN, DAC_OVERRIDE]
+    device: [/dev/net/tun:/dev/net/tun]
+    security_opt: [label=disable, no-new-privileges]
+    read_only: "{{ node_role != 'control' }}"
+    tmpfs: {/run: 'rw,nosuid,nodev', /tmp: 'rw,nosuid,nodev'}
+    env: "{{ {'SSL_CERT_FILE': '/run/secrets/headscale-ca.pem'} if headscale_ca_file | length > 0 else {} }}"
+    volume: "{{ [ (node_dir | realpath) + '/config.yaml:/etc/node/config.yaml:ro', (node_dir | realpath) + '/secrets:/run/secrets:ro', container_name + '-state:/var/lib/tailscale', container_name + '-cache:/var/lib/node'] + ([container_name + '-db:/etc/x-ui'] if node_role == 'control' else []) }}"
+    stop_timeout: 20
+    label: {io.vless.deployment: "{{ deployment_id }}"}
+  register: node_container
+- name: Wait for node supervision and initial configuration
+  ansible.builtin.command:
+    argv: [podman, exec, "{{ container_name }}", test, -f, /run/node/ready]
+  register: node_ready
+  changed_when: false
+  until: node_ready.rc == 0
+  retries: 60
+  delay: 2
+- name: Discover the persistent mesh address
+  ansible.builtin.command:
+    argv: [podman, exec, "{{ container_name }}", tailscale, ip, -4]
+  register: mesh_address
+  changed_when: false
+- name: Retain the discovered mesh address for later plays
+  ansible.builtin.set_fact:
+    mesh_ip: "{{ mesh_address.stdout | trim }}"

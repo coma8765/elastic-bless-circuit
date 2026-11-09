@@ -1,0 +1,33 @@
+all:
+  children:
+    vless:
+      vars:
+        ansible_user: deploy
+        deployment_id: production
+        headscale_url: https://headscale.example.com
+        vless_users:
+        - email: alice-eu
+          exit: out-eu
+        - email: alice-us
+          exit: out-us
+      children:
+        headscale:
+          hosts:
+            headscale:
+              ansible_host: 192.0.2.10
+        control:
+          hosts:
+            control:
+              ansible_host: 192.0.2.11
+        exits:
+          hosts:
+            out-eu:
+              ansible_host: 192.0.2.12
+            out-us:
+              ansible_host: 192.0.2.13
+        ingress:
+          hosts:
+            in-eu:
+              ansible_host: 192.0.2.14
+              ingress_public_address: in-eu.example.com
+              ingress_server_name: in-eu.example.com

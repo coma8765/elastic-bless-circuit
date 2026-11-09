@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: C++ and deployment checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install C++ build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++ make cmake libyaml-cpp-dev nlohmann-json3-dev libcurl4-openssl-dev openssl
+      - name: Install deployment test dependencies
+        run: |
+          python -m venv .local/ansible-venv
+          .local/ansible-venv/bin/python -m pip install -r deploy/ansible/requirements.txt
+          .local/ansible-venv/bin/ansible-galaxy collection install -r deploy/ansible/requirements.yml -p .local/ansible-collections
+      - name: Run source and deployment checks
+        run: ./scripts/ci.sh
+
+  renderer:
+    name: Compiled container configuration contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y podman netavark aardvark-dns iptables
+      - name: Build the common node image
+        run: |
+          sudo podman build --format oci -t localhost/vless-node:build -f infra/Dockerfile.common .
+          sudo podman build --format docker -t localhost/vless-node:dev -f infra/Dockerfile.release .
+      - name: Validate the compiled renderer and Xray configurations
+        run: sudo env PATH="$PATH" "$(command -v python)" tests/validate.py

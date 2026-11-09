@@ -1,0 +1,150 @@
+- name: Require a complete, unambiguous topology
+  ansible.builtin.assert:
+    that:
+      - groups.headscale | length == 1
+      - groups.control | length == 1
+      - groups.exits | length > 0
+      - groups.ingress | length > 0
+      - (groups.headscale + groups.control + groups.exits + groups.ingress) | unique | length == (groups.headscale + groups.control + groups.exits + groups.ingress) | length
+      - deployment_id is match('^[a-z][a-z0-9-]{0,30}$')
+      - headscale_url is match('^https://[^/]+$')
+      - vless_users | map(attribute='email') | unique | length == vless_users | length
+      - not ansible_check_mode
+    fail_msg: "Use the complete inventory; initial provisioning cannot run in check mode."
+- name: Validate stable mesh hostnames
+  ansible.builtin.assert:
+    that:
+      - (deployment_id + '-' + item) | length <= 63
+      - item is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+  loop: "{{ groups.control + groups.exits + groups.ingress }}"
+- name: Validate names used in paths and routes
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')
+  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress + (vless_users | map(attribute='email') | list) }}"
+- name: Validate user exit assignments
+  ansible.builtin.assert:
+    that: ["item.exit in groups.exits"]
+  loop: "{{ vless_users }}"
+  loop_control: {label: "{{ item.email }}"}
+- name: Prepare private controller directories
+  ansible.builtin.file:
+    path: "{{ controller_state_dir }}/{{ item }}"
+    state: directory
+    mode: '0700'
+  loop: ['', tls, users, transit, enrollment]
+  delegate_to: localhost
+  become: false
+- name: Persist UUID entropy and subscription tokens
+  ansible.builtin.copy:
+    dest: "{{ controller_state_dir }}/users/{{ item.email }}.{{ suffix }}"
+    content: "{{ (lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) | to_uuid) if suffix == 'uuid' else lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
+    force: false
+    mode: '0600'
+  loop: "{{ vless_users }}"
+  loop_control: {label: "{{ item.email }}"}
+  vars: {suffix: uuid}
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Persist subscription tokens
+  ansible.builtin.copy:
+    dest: "{{ controller_state_dir }}/users/{{ item.email }}.sub"
+    content: "{{ lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
+    force: false
+    mode: '0600'
+  loop: "{{ vless_users }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Persist independent exit credentials
+  ansible.builtin.copy:
+    dest: "{{ controller_state_dir }}/transit/{{ item }}.uuid"
+    content: "{{ lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) | to_uuid }}"
+    force: false
+    mode: '0600'
+  loop: "{{ groups.exits }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Read or create the persistent panel credential
+  ansible.builtin.set_fact:
+    panel_password: "{{ lookup('ansible.builtin.password', controller_state_dir + '/panel-password', length=48, chars=['ascii_letters', 'digits']) }}"
+    managed_users: []
+    ingress_endpoints: []
+  no_log: true
+- name: Assemble managed user identities
+  ansible.builtin.set_fact:
+    managed_users: "{{ managed_users + [dict(email=item.email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.email + '.sub'), enabled=item.enabled | default(true))] }}"
+  loop: "{{ vless_users }}"
+  no_log: true
+- name: Assemble public ingress endpoints
+  ansible.builtin.set_fact:
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
+  loop: "{{ groups.ingress }}"
+- name: Generate local test certificates only
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -newkey
+      - rsa:2048
+      - -sha256
+      - -days
+      - '7'
+      - -nodes
+      - -subj
+      - "/CN={{ cert_name }}"
+      - -addext
+      - "subjectAltName=DNS:{{ cert_name }},IP:127.0.0.1"
+      - -addext
+      - "basicConstraints=critical,CA:{{ 'TRUE' if item == 'headscale' else 'FALSE' }}"
+      - -keyout
+      - "{{ controller_state_dir }}/tls/{{ item }}.key"
+      - -out
+      - "{{ controller_state_dir }}/tls/{{ item }}.crt"
+    creates: "{{ controller_state_dir }}/tls/{{ item }}.crt"
+  vars:
+    cert_name: "{{ (headscale_url | urlsplit('hostname')) if item == 'headscale' else ('subscriptions.vless.test' if item == 'control' else hostvars[item].ingress_server_name) }}"
+  loop: "{{ ['headscale', 'control'] + groups.ingress }}"
+  when: local_mode | bool
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Restrict generated TLS keys
+  ansible.builtin.file:
+    path: "{{ controller_state_dir }}/tls/{{ item }}.key"
+    mode: '0600'
+  loop: "{{ ['headscale', 'control'] + groups.ingress }}"
+  when: local_mode | bool
+  delegate_to: localhost
+  become: false
+- name: Validate control certificates before changing remote services
+  vless_tls_check:
+    cert_path: "{{ item.cert }}"
+    key_path: "{{ item.key }}"
+    hostname: "{{ item.hostname }}"
+  loop:
+    - {cert: "{{ headscale_tls_cert }}", key: "{{ headscale_tls_key }}", hostname: "{{ headscale_url | urlsplit('hostname') }}"}
+    - {cert: "{{ control_tls_cert }}", key: "{{ control_tls_key }}", hostname: "{{ subscription_public_url | urlsplit('hostname') }}"}
+  delegate_to: localhost
+  become: false
+- name: Validate ingress certificates before changing remote services
+  vless_tls_check:
+    cert_path: "{{ hostvars[item].ingress_tls_cert }}"
+    key_path: "{{ hostvars[item].ingress_tls_key }}"
+    hostname: "{{ hostvars[item].ingress_server_name }}"
+  loop: "{{ groups.ingress }}"
+  delegate_to: localhost
+  become: false
+- name: Write private subscription handoff data
+  ansible.builtin.copy:
+    dest: "{{ controller_state_dir }}/subscriptions.json"
+    content: "{{ subscription_links | to_nice_json }}\n"
+    mode: '0600'
+  vars:
+    subscription_links: "{{ dict(managed_users | map(attribute='email') | zip(managed_users | map(attribute='sub_id') | map('regex_replace', '^', subscription_public_url + '/sub/'))) }}"
+  delegate_to: localhost
+  become: false
+  no_log: true

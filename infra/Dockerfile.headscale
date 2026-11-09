@@ -1,0 +1,7 @@
+FROM ghcr.io/juanfont/headscale:0.29.7 AS upstream
+FROM docker.io/library/debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini curl && rm -rf /var/lib/apt/lists/*
+COPY --from=upstream /ko-app/headscale /usr/local/bin/headscale
+VOLUME ["/var/lib/headscale"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/headscale"]
+CMD ["serve"]

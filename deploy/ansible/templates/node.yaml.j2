@@ -1,0 +1,50 @@
+{% if node_role != 'control' %}
+role: {{ node_role }}
+{% endif %}
+mesh:
+  enabled: true
+  server: {{ headscale_url | to_json }}
+  hostname: {{ container_name | to_json }}
+  auth_key_file: /run/secrets/headscale-key
+{% if node_role == 'control' %}
+panel_settings:
+  username_file: /run/secrets/panel-user
+  password_file: /run/secrets/panel-password
+  port: 2053
+  base_path: /
+{% elif node_role == 'out' %}
+listener: {address: mesh, port: {{ transit_port }}}
+transit_uuid_file: /run/secrets/transit-uuid
+allow_private_destinations: {{ allow_private_destinations | bool | lower }}
+{% else %}
+sync_seconds: {{ sync_seconds }}
+max_stale_seconds: {{ max_stale_seconds }}
+listener:
+  address: 0.0.0.0
+  port: {{ ingress_port }}
+  stream:
+    network: tcp
+    security: tls
+    tlsSettings:
+      certificates:
+        - certificateFile: /run/secrets/fullchain.pem
+          keyFile: /run/secrets/privkey.pem
+panel:
+  # HTTP is carried exclusively inside authenticated WireGuard, never public IPs.
+  url: http://{{ hostvars[groups.control[0]].mesh_ip }}:2053
+  allow_http: true
+  username_file: /run/secrets/panel-user
+  password_file: /run/secrets/panel-password
+  inbound_id: {{ hostvars[groups.control[0]].panel_directory.inbound_id }}
+exits:
+{% for peer in groups.exits %}
+  - name: {{ peer | to_json }}
+    address: {{ hostvars[peer].mesh_ip | to_json }}
+    port: {{ hostvars[peer].transit_port }}
+    uuid_file: /run/secrets/{{ peer }}-uuid
+{% endfor %}
+routes:
+{% for user in vless_users %}
+  {{ user.email | to_json }}: {{ user.exit | to_json }}
+{% endfor %}
+{% endif %}

@@ -1,0 +1,9 @@
+# Only build inputs enter the container build context.
+**
+!CMakeLists.txt
+!src/
+!src/**
+!infra/
+!infra/Dockerfile.*
+!infra/download.sh
+!infra/entrypoint.sh

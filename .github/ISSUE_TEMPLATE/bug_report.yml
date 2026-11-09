@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible failure using sanitized configuration.
+body:
+  - type: markdown
+    attributes:
+      value: "For security vulnerabilities, follow SECURITY.md instead. Never attach credentials, subscription URLs, databases or .local/ files."
+  - type: input
+    id: version
+    attributes:
+      label: Commit and environment
+      description: Commit SHA, CPU architecture, host OS and Podman version.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps and configuration using synthetic credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Only relevant log lines; remove secrets and personal information.
+      render: text

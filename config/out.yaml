@@ -1,0 +1,11 @@
+role: out
+mesh:
+  enabled: true
+  server: https://headscale.example.com
+  hostname: out-eu-1
+  auth_key_file: /run/secrets/headscale-key
+listener:
+  address: mesh
+  port: 8443
+transit_uuid_file: /run/secrets/transit-uuid
+allow_private_destinations: false

@@ -1,0 +1,87 @@
+name: Full Podman integration
+
+# This intentionally runs only on a fresh GitHub-hosted runner, on request.
+# It starts privileged networking fixtures and must never target a shared stand.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: Mesh, recovery and Ansible topology growth
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install runtime dependencies and check TUN
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y podman netavark aardvark-dns iptables openssl
+          sudo modprobe tun || true
+          test -c /dev/net/tun
+          mkdir -p .local/ci-private
+          chmod 700 .local/ci-private
+          python -m venv .local/ansible-venv
+          .local/ansible-venv/bin/python -m pip install -r deploy/ansible/requirements.txt
+          .local/ansible-venv/bin/ansible-galaxy collection install -r deploy/ansible/requirements.yml -p .local/ansible-collections
+      - name: Build all Debian service images
+        run: sudo env PATH="$PATH" ./scripts/build.sh
+      - name: Check container networking capabilities
+        run: |
+          sudo podman run --rm --no-healthcheck --cap-add=NET_ADMIN --device=/dev/net/tun --security-opt=label=disable --entrypoint /bin/sh localhost/vless-node:dev -c 'ip tuntap add dev ci-probe mode tun && ip link show ci-probe'
+      - name: Test real mesh routing and recovery
+        run: |
+          ci_python="$(command -v python)"
+          for stage in up test; do
+            if ! sudo env PATH="$PATH" "$ci_python" tests/stand.py "$stage" > ".local/ci-private/stand-$stage.log" 2>&1; then
+              echo "::error::The stand $stage stage failed. Logs remain private to this disposable runner; reproduce locally for detailed diagnostics."
+              exit 1
+            fi
+          done
+          for suite in tls stability; do
+            if ! sudo env PATH="$PATH" "$ci_python" "tests/$suite.py" > ".local/ci-private/$suite.log" 2>&1; then
+              echo "::error::The $suite suite failed. Logs are not uploaded because generated credentials may appear in diagnostics."
+              exit 1
+            fi
+          done
+      - name: Test Ansible idempotence and account continuity
+        run: |
+          if ! sudo env PATH="$PATH" "$(command -v python)" tests/ansible.py > .local/ci-private/ansible.log 2>&1; then
+            echo "::error::Ansible deployment, idempotence, or topology growth failed. Reproduce locally; job-local logs are not uploaded."
+            exit 1
+          fi
+          echo 'Real Headscale/VLESS, TLS, cache recovery, Ansible idempotence and user/node growth checks passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove only integration fixtures
+        if: always()
+        run: |
+          ci_python="$(command -v python || command -v python3)"
+          mkdir -p .local/ci-private
+          chmod 700 .local/ci-private
+          ci_cleanup_failed=0
+          if test -f .local/ansible-test/resources.json; then
+            if ! sudo env PATH="$PATH" "$ci_python" tests/ansible.py down > .local/ci-private/ansible-cleanup.log 2>&1; then
+              echo "::error::The isolated Ansible fixture cleanup failed."
+              ci_cleanup_failed=1
+            fi
+          fi
+          if test -f tests/stand.py; then
+            if ! sudo env PATH="$PATH" "$ci_python" tests/stand.py down > .local/ci-private/stand-cleanup.log 2>&1; then
+              echo "::error::The isolated routing stand cleanup failed."
+              ci_cleanup_failed=1
+            fi
+          fi
+          # Never upload .local, raw container logs, certificates or generated keys.
+          exit "$ci_cleanup_failed"

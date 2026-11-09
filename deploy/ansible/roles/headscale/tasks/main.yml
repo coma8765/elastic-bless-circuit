@@ -1,0 +1,48 @@
+- name: Render Headscale configuration
+  ansible.builtin.template:
+    src: headscale.yaml.j2
+    dest: "{{ node_dir }}/config.yaml"
+    mode: '0600'
+  register: headscale_config
+- name: Render restrictive mesh policy
+  ansible.builtin.template:
+    src: policy.json.j2
+    dest: "{{ node_dir }}/policy.json"
+    mode: '0600'
+  register: headscale_policy
+- name: Install Headscale TLS credentials
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ node_dir }}/{{ item.dest }}"
+    mode: '0600'
+  loop:
+    - {src: "{{ headscale_tls_cert }}", dest: cert.pem}
+    - {src: "{{ headscale_tls_key }}", dest: key.pem}
+  no_log: true
+  register: headscale_certs
+- name: Start the HTTPS coordination server
+  containers.podman.podman_container:
+    name: "{{ container_name }}"
+    image: "{{ headscale_image }}"
+    state: started
+    recreate: "{{ headscale_config.changed or headscale_policy.changed or headscale_certs.changed }}"
+    restart_policy: always
+    network: "{{ podman_network }}"
+    publish: "{{ headscale_publish }}"
+    security_opt: [label=disable, no-new-privileges]
+    volume:
+      - "{{ node_dir | realpath }}:/etc/headscale:ro"
+      - "{{ container_name }}-state:/var/lib/headscale"
+    label: {io.vless.deployment: "{{ deployment_id }}"}
+- name: Wait for Headscale database and control socket
+  ansible.builtin.command:
+    argv: [podman, exec, "{{ container_name }}", headscale, nodes, list, -o, json]
+  register: headscale_nodes
+  changed_when: false
+  until: headscale_nodes.rc == 0
+  retries: 45
+  delay: 2
+- name: Provision independent node enrollment credentials
+  ansible.builtin.include_tasks: enrollment.yml
+  loop: "{{ groups.control + groups.exits + groups.ingress }}"
+  loop_control: {loop_var: mesh_node}

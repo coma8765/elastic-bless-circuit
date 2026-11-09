@@ -1,0 +1,60 @@
+- name: Deploy control with its persistent database
+  ansible.builtin.include_role:
+    name: node
+  vars:
+    node_role: control
+- name: Wait for the private admin API
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_host_port }}/csrf-token"
+    status_code: 200
+  register: panel_http
+  until: panel_http.status == 200
+  retries: 45
+  delay: 2
+- name: Reconcile directory users and public subscription endpoints
+  vless_panel:
+    url: "http://127.0.0.1:{{ panel_host_port }}"
+    username: "{{ panel_username }}"
+    password: "{{ hostvars[groups.headscale[0]].panel_password }}"
+    users: "{{ hostvars[groups.headscale[0]].managed_users }}"
+    ingress_endpoints: "{{ hostvars[groups.headscale[0]].ingress_endpoints }}"
+  register: panel_directory
+  no_log: true
+- name: Install subscription TLS credentials
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ node_dir }}/secrets/{{ item.dest }}"
+    mode: '0600'
+  loop:
+    - {src: "{{ control_tls_cert }}", dest: subscription-cert.pem}
+    - {src: "{{ control_tls_key }}", dest: subscription-key.pem}
+  register: gateway_certs
+  no_log: true
+- name: Discover the container network DNS resolver
+  ansible.builtin.command:
+    argv: [podman, network, inspect, "{{ podman_network }}"]
+  register: gateway_network
+  changed_when: false
+- name: Render the subscription-only HTTPS gateway with dynamic upstream DNS
+  ansible.builtin.template:
+    src: gateway.conf.j2
+    dest: "{{ node_dir }}/gateway.conf"
+    mode: '0600'
+  vars:
+    gateway_dns: "{{ (gateway_network.stdout | from_json)[0].subnets[0].gateway }}"
+  register: gateway_config
+- name: Start the HTTPS subscription gateway
+  containers.podman.podman_container:
+    name: "{{ deployment_id }}-gateway"
+    image: "{{ gateway_image }}"
+    state: started
+    restart_policy: always
+    recreate: "{{ gateway_config.changed or gateway_certs.changed }}"
+    network: "{{ podman_network }}"
+    publish: "{{ gateway_publish }}"
+    security_opt: [label=disable, no-new-privileges]
+    volume:
+      - "{{ (node_dir | realpath) + '/gateway.conf:/etc/nginx/conf.d/subscription.conf:ro' }}"
+      - "{{ (node_dir | realpath) + '/secrets/subscription-cert.pem:/etc/nginx/cert.pem:ro' }}"
+      - "{{ (node_dir | realpath) + '/secrets/subscription-key.pem:/etc/nginx/key.pem:ro' }}"
+    label: {io.vless.deployment: "{{ deployment_id }}"}

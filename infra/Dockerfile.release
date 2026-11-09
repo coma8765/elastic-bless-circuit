@@ -1,0 +1,4 @@
+# Podman caches intermediate OCI layers separately from Docker-format layers.
+# Package the cached common image in Docker format to retain HEALTHCHECK metadata.
+FROM localhost/vless-node:build
+HEALTHCHECK --interval=10s --timeout=3s --start-period=90s --retries=3 CMD test -f /run/node/ready && test $(($(date +%s) - $(stat -c %Y /run/node/ready))) -lt 45

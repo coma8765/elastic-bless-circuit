@@ -1,0 +1,42 @@
+---
+- name: Resolve per-host deployment settings
+  hosts: headscale:control:exits:ingress
+  gather_facts: false
+  roles: [deployment_defaults]
+
+- name: Validate topology and prepare controller credentials
+  hosts: headscale
+  gather_facts: false
+  tasks:
+    - name: Prepare the deployment controller
+      ansible.builtin.include_tasks: tasks/controller.yml
+      run_once: true
+
+- name: Prepare Podman hosts and images
+  hosts: headscale:control:exits:ingress
+  gather_facts: true
+  # Local inventory maps several logical services to one physical machine.
+  serial: 1
+  roles: [prepare]
+
+- name: Deploy Headscale and issue per-node enrollment keys
+  hosts: headscale
+  gather_facts: false
+  roles: [headscale]
+
+- name: Deploy control and subscription gateway
+  hosts: control
+  gather_facts: false
+  roles: [control]
+
+- name: Deploy exits and discover persistent mesh addresses
+  hosts: exits
+  gather_facts: false
+  serial: 1
+  roles: [node]
+
+- name: Deploy ingress with explicit authenticated routes
+  hosts: ingress
+  gather_facts: false
+  serial: 1
+  roles: [ingress]

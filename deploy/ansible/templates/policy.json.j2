@@ -1,0 +1,7 @@
+{
+  "tagOwners": {"tag:in": [], "tag:out": [], "tag:control": []},
+  "acls": [
+    {"action": "accept", "src": ["tag:in"], "dst": [{% for port in groups.exits | map('extract', hostvars, 'transit_port') | unique %}"tag:out:{{ port }}"{% if not loop.last %}, {% endif %}{% endfor %}], "proto": "tcp"},
+    {"action": "accept", "src": ["tag:in"], "dst": ["tag:control:2053"], "proto": "tcp"}
+  ]
+}

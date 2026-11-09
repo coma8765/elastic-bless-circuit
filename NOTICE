@@ -1,0 +1,8 @@
+VLESS VPN System
+Copyright 2026 VLESS VPN System contributors
+
+This repository's original source code, configuration, and documentation are
+licensed under the Apache License, Version 2.0.
+
+Third-party software remains under its respective licenses. See
+THIRD_PARTY_NOTICES.md for the components used by the build and deployment.

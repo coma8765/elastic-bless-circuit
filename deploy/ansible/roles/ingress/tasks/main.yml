@@ -1,0 +1,5 @@
+- name: Deploy the public ingress
+  ansible.builtin.include_role:
+    name: node
+  vars:
+    node_role: in

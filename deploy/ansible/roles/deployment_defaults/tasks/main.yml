@@ -1,0 +1,5 @@
+- name: Resolve defaults without overriding inventory values
+  ansible.builtin.set_fact:
+    "{{ item }}": "{{ lookup('ansible.builtin.vars', item) }}"
+  loop: "{{ (lookup('ansible.builtin.file', role_path + '/defaults/main.yml') | from_yaml).keys() | list }}"
+  no_log: true
