@@ -8,7 +8,8 @@ Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The curren
 | `tests/ansible_modules.py` | 19 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI/public-origin validation, alias inheritance/collision checks and mixed-profile rejection |
 | `tests/reality_keys.py` | 11 | Persistent X25519 identities, private-file permissions, concurrent publication and key-pair consistency |
 | `tests/edge_modules.py` | 30 | Owned edge routes, quoted/case-insensitive SNI collision rejection, RFC1918 backend opt-in, subscription-only routing, separate certificate/hook ownership, check mode and rollback |
-| `tests/reality_panel.py` | 11 | Actual 3x-ui APIs and generated subscriptions, public URL persistence without restart/identity changes, alias/account/ingress growth, migration, idempotence and cleanup |
+| `tests/reality_panel.py` | 14 + cleanup | Actual 3x-ui APIs and generated subscriptions, public URL persistence, aliases, eight-profile exit choices, group revocation, operator-link preservation, migration and idempotence |
+| `tests/user_routes.py --with-renderer` | 9 | Pure route validation/HMAC contracts, actual controller identity persistence and pre-write rejection, grouped disable/remove/re-add, plus compiled renderer/Xray acceptance |
 | `tests/build_staging.py` | 1 | Three roles sharing one host: initial build, unchanged reruns, source/image upgrades and missing-image recovery |
 | `tests/container_overrides.py` | 2 engines | Actual Podman and Docker: DNS/hosts addition, removal and unchanged reruns using disposable containers |
 
@@ -24,7 +25,11 @@ The isolated panel integration verified:
 8. Removing an owned ingress retires only its subscription profile.
 9. Migration back to TLS produces TLS links without stale REALITY parameters; unchanged reruns report no changes.
 10. TLS aliases inherit the primary SNI and preserve directory identities and user memberships through addition/removal.
-11. The uniquely named test container and private database volume are removed.
+11. Four exit identities and two advertised ingress addresses produce eight uniquely labeled profiles in the original subscription, with distinct backend subscription IDs.
+12. Removing/re-adding an exit choice retains its UUID and the base account's original subscription token.
+13. Disabling the base disables all four client identities and six managed static links; no child links are exported, and an unrelated subscription remains active. The panel may retain two disabled base-native links in its output; their presence is not evidence of authorization.
+14. Unrelated operator external links retain their supported fields across grouped changes, including rows with reserved-looking remarks but unowned `namePrefix` values.
+15. The uniquely named test container and private database volume are removed.
 
 Reproduce from the repository root after installing the deployment's pinned Ansible requirements:
 
@@ -36,6 +41,7 @@ python3 tests/validate.py
 .local/ansible-venv/bin/python tests/edge_modules.py
 .local/ansible-venv/bin/python tests/build_staging.py
 .local/ansible-venv/bin/python tests/reality_panel.py
+.local/ansible-venv/bin/python tests/user_routes.py --with-renderer
 .local/ansible-venv/bin/python tests/container_overrides.py --engine podman
 ```
 
@@ -63,3 +69,5 @@ A separate two-host Docker deployment was exercised through Ansible with a publi
 - A live host reboot was not performed because the hosts also run existing services.
 
 Private evidence is under `.local/live/`: `traffic-report.json`, `mesh-report.json`, `renderer-docker.log`, and the edge/deployment Ansible logs. These artifacts are excluded from publication.
+
+The deployment was subsequently expanded with three Docker out nodes, staged before publishing their routes. No public ports were added on those out containers. The original ingress's public and LAN addresses now each advertise all four exits, producing eight distinctly named profiles in the unchanged base subscription. Local Podman clients verified every profile against two independent IP services and rejected unknown UUIDs; an external Docker client verified all four public choices. Temporary clients were removed and their absence checked. Original account identifiers, directory keys, panel settings, nginx configuration/certificates and unrelated workloads were preserved. The complete seven-host Ansible rerun and three-host bootstrap rerun both finished with zero changes and failures. Private evidence is under `.local/live/cities/`.

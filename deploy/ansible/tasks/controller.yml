@@ -27,6 +27,16 @@
     that: ["item.exit in groups.exits"]
   loop: "{{ vless_users }}"
   loop_control: {label: "{{ item.email }}"}
+- name: Validate and expand subscription exit identities before writing secrets
+  vless_user_routes:
+    users: "{{ vless_users }}"
+    exits: "{{ groups.exits }}"
+  register: expanded_user_routes
+  no_log: true
+- name: Retain the validated expanded subscription route map
+  ansible.builtin.set_fact:
+    expanded_users: "{{ expanded_user_routes.expanded_users }}"
+  no_log: true
 - name: Prepare private controller directories
   ansible.builtin.file:
     path: "{{ controller_state_dir }}/{{ item }}"
@@ -41,7 +51,7 @@
     content: "{{ (lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) | to_uuid) if suffix == 'uuid' else lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
     force: false
     mode: '0600'
-  loop: "{{ vless_users }}"
+  loop: "{{ expanded_users }}"
   loop_control: {label: "{{ item.email }}"}
   vars: {suffix: uuid}
   delegate_to: localhost
@@ -75,8 +85,8 @@
   no_log: true
 - name: Assemble managed user identities
   ansible.builtin.set_fact:
-    managed_users: "{{ managed_users + [dict(email=item.email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.email + '.sub'), enabled=item.enabled | default(true))] }}"
-  loop: "{{ vless_users }}"
+    managed_users: "{{ managed_users + [dict(email=item.email, subscription_owner=item.base_email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.base_email + '.sub'), enabled=item.enabled)] }}"
+  loop: "{{ expanded_users }}"
   no_log: true
 - name: Validate ingress transport selection
   ansible.builtin.assert:
@@ -185,7 +195,8 @@
     content: "{{ subscription_links | to_nice_json }}\n"
     mode: '0600'
   vars:
-    subscription_links: "{{ dict(managed_users | map(attribute='email') | zip(managed_users | map(attribute='sub_id') | map('regex_replace', '^', subscription_public_url + '/sub/'))) }}"
+    public_users: "{{ managed_users | selectattr('email', 'in', vless_users | map(attribute='email') | list) | list }}"
+    subscription_links: "{{ dict(public_users | map(attribute='email') | zip(public_users | map(attribute='sub_id') | map('regex_replace', '^', subscription_public_url + '/sub/'))) }}"
   delegate_to: localhost
   become: false
   no_log: true

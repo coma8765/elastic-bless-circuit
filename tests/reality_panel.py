@@ -83,13 +83,15 @@ def run(engine, image):
         output, _ = cli('port', name, str(port) + '/tcp')
         return int(output.splitlines()[0].rsplit(':', 1)[1])
 
-    def subscription(record):
+    def subscription(record, allowed_uuids=None, allow_empty=False):
         raw = urllib.request.urlopen('http://127.0.0.1:' + str(subscription_port) + '/sub/' +
                                      urllib.parse.quote(record['sub_id'], safe=''), timeout=15).read()
         body = raw.decode() if raw.startswith(b'vless://') else base64.b64decode(raw).decode()
         links = [urllib.parse.urlsplit(line) for line in body.splitlines() if line.startswith('vless://')]
-        assert links, 'subscription has no VLESS entries'
-        assert all(link.username == record['uuid'] for link in links), 'subscription changed the assigned UUID'
+        if not allow_empty:
+            assert links, 'subscription has no VLESS entries'
+        allowed = set(allowed_uuids) if allowed_uuids is not None else {record['uuid']}
+        assert all(link.username in allowed for link in links), 'subscription changed the assigned UUID'
         return links
 
     def verify_entries(records, endpoints):
@@ -244,6 +246,99 @@ def run(engine, image):
         assert reconcile()['inbound_ids'] == tls_ids and not reconcile()['changed']
         assert all(len(subscription(record)) == 1 for record in [alice, bob])
         checks.append('TLS aliases inherit the primary SNI and retain the same directory and user memberships')
+
+        # One existing account exposes independent outbound choices through one
+        # unchanged token. The original protocol identity remains the first choice.
+        route_spec = importlib.util.spec_from_file_location('vless_user_routes', ROOT / 'deploy/ansible/library/vless_user_routes.py')
+        route_module = importlib.util.module_from_spec(route_spec)
+        route_spec.loader.exec_module(route_module)
+        ingress_a['aliases'] = [{'address': 'public.example.com', 'port': 443, 'remark': 'public'}]
+        module.params['ingress_endpoints'] = [ingress_a]
+        module.params['users'] = [alice, bob]
+        migration = reconcile()
+        api_calls.clear()
+        repeated = reconcile()
+        assert migration['changed'], 'grouped baseline migration should change the profile'
+        assert not repeated['changed'], 'grouped baseline migration repeated writes: ' + ','.join(api_calls)
+        grouped_id = reconcile()['inbound_ids']['ingress-a']
+        grouped_key = client.call('/panel/api/inbounds/get/' + str(grouped_id))['streamSettings']['realitySettings']['privateKey']
+        original_owner = (alice['uuid'], alice['sub_id'])
+        choices = ['exit-alice', 'prague', 'frankfurt', 'singapore']
+        base = {'email': alice['email'], 'exit': choices[0], 'additional_exits': choices[1:]}
+        persisted_uuids = {alice['email']: alice['uuid']}
+        def grouped_users():
+            expanded = route_module.expand([base], choices)
+            result = []
+            for item in expanded:
+                identity = persisted_uuids.setdefault(item['email'], str(uuid.uuid4()))
+                result.append(dict(email=item['email'], exit=item['exit'], uuid=identity,
+                                   sub_id=alice['sub_id'], enabled=item['enabled'], subscription_owner=alice['email']))
+            return result
+        grouped = grouped_users()
+        module.params['users'] = grouped + [bob]
+        assert reconcile()['changed'] and not reconcile()['changed']
+        assert len({record['sub_id'] for record in module.params['users'] if record['email'] != bob['email']}) == 4, 'grouped identities need unique backend tokens'
+        allowed = {record['uuid'] for record in grouped}
+        links = subscription(alice, allowed)
+        assert len(links) == 8, 'four outbound identities and two aliases must yield eight profiles'
+        assert {(link.username, link.hostname, link.port) for link in links} == {
+            (identity, address, 443) for identity in allowed for address in
+            [ingress_a['address'], 'public.example.com']}, 'grouped subscription has wrong profile cross product'
+        assert len({urllib.parse.unquote(link.fragment) for link in links}) == 8, 'grouped profile labels must be unique'
+        assert (alice['uuid'], alice['sub_id']) == original_owner
+        assert reconcile()['inbound_ids']['ingress-a'] == grouped_id
+        assert client.call('/panel/api/inbounds/get/' + str(grouped_id))['streamSettings']['realitySettings']['privateKey'] == grouped_key
+        verify_entries([bob], [ingress_a, dict(ingress_a, address='public.example.com')])
+        checks.append('one original subscription exposes eight uniquely labeled profiles for four identities and two aliases')
+        # An operator-owned disabled link must survive every managed group edit.
+        external_path = '/panel/api/clients/' + urllib.parse.quote(alice['email'], safe='') + '/externalLinks'
+        owner_path = '/panel/api/clients/get/' + urllib.parse.quote(alice['email'], safe='')
+        operator_link = {'kind': 'link', 'value': 'vless://' + str(uuid.uuid4()) + '@operator.example.com:443?security=tls&type=tcp#operator',
+                         'remark': 'vless-mesh-ansible:operator-preserved', 'enable': False,
+                         'expiryTime': 4102444800000, 'namePrefix': 'operator-'}
+        owner_record = client.call(owner_path)
+        client.call(external_path, {'externalLinks': (owner_record.get('externalLinks') or []) + [operator_link]})
+        operator_before = [row for row in client.call(owner_path)['externalLinks'] if row.get('remark') == operator_link['remark']]
+        assert len(operator_before) == 1
+        reconcile()  # Canonicalizes managed-vs-operator ordering once.
+        assert not reconcile()['changed']
+        assert all(operator_before[0].get(key) == value for key,value in operator_link.items())
+
+        removed = next(record for record in grouped if record['exit'] == 'frankfurt')
+        base['additional_exits'].remove('frankfurt')
+        module.params['users'] = grouped_users() + [bob]
+        assert reconcile()['changed'] and not reconcile()['changed']
+        active = {record['uuid'] for record in module.params['users'] if record['email'] != bob['email']}
+        assert len(subscription(alice, active)) == 6
+        stored = {record['email']:record for record in client.call('/panel/api/clients/list')}
+        assert stored[removed['email']]['uuid'] == removed['uuid'] and not stored[removed['email']]['enable']
+        base['additional_exits'] = choices[1:]
+        module.params['users'] = grouped_users() + [bob]
+        assert reconcile()['changed'] and not reconcile()['changed']
+        assert len(subscription(alice, allowed)) == 8
+        assert (alice['uuid'], alice['sub_id']) == original_owner
+        checks.append('removing and readding an outbound choice retains its UUID and the original subscription token')
+        base['enabled'] = False
+        module.params['users'] = grouped_users() + [bob]
+        assert reconcile()['changed'] and not reconcile()['changed']
+        disabled_links = subscription(alice, allowed, allow_empty=True)
+        # 3x-ui retains its base account's two native share links even when
+        # disabled; authentication revocation is the global enable flag.
+        assert all(link.username == alice['uuid'] for link in disabled_links), 'disabled child choice still advertised'
+        stored = {record['email']:record for record in client.call('/panel/api/clients/list')}
+        assert all(not stored[record['email']]['enable'] for record in grouped)
+        disabled_rows = [row for row in client.call(owner_path)['externalLinks'] if urllib.parse.urlsplit(row.get('value','')).username in allowed - {alice['uuid']}]
+        assert len(disabled_rows) == 6 and all(not row['enable'] for row in disabled_rows)
+        assert stored[bob['email']]['enable'], 'disabling a subscription affected an unrelated account'
+        base['enabled'] = True
+        module.params['users'] = grouped_users() + [bob]
+        assert reconcile()['changed'] and not reconcile()['changed']
+        assert len(subscription(alice, allowed)) == 8
+        operator_after = [row for row in client.call(owner_path)['externalLinks'] if row.get('remark') == operator_link['remark']]
+        assert len(operator_after) == 1 and all(operator_after[0].get(key) == value for key,value in operator_link.items())
+        checks.append('disabling the base revokes every grouped identity while an unrelated subscription remains active')
+        checks.append('native subscription composition preserves unrelated operator external links across choice edits')
+
         for check in checks:
             print('PASS ' + check, flush=True)
         return checks
@@ -264,7 +359,9 @@ def main():
         run(args.engine, args.image)
         return 0
     except Exception as error:
-        print('FAIL isolated REALITY panel integration: ' + str(error), file=sys.stderr)
+        import traceback
+        location = traceback.extract_tb(error.__traceback__)[-1]
+        print('FAIL isolated REALITY panel integration at ' + Path(location.filename).name + ':' + str(location.lineno) + ': ' + (str(error) or type(error).__name__), file=sys.stderr)
         return 1
 
 

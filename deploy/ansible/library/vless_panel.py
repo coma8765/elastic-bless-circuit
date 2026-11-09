@@ -18,6 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import hashlib
+import hmac
 
 from ansible.module_utils.basic import AnsibleModule
 
@@ -57,6 +59,8 @@ options:
     description: Optional HTTPS origin for advertised subscription links; omission preserves the current override.
     type: str
 notes:
+  - subscription_owner groups child identities through native external links; child backend subscription IDs are derived from the unchanged owner token.
+  - Static external-link namePrefix values beginning vless-mesh-ansible: are reserved; unrelated rows are preserved.
   - Each ingress endpoint may include aliases containing address, port and remark; aliases inherit its security profile and use the same directory.
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
@@ -66,6 +70,7 @@ notes:
 
 MANAGED = "vless-mesh-ansible/v1"
 DIRECTORY = "vless-mesh-ansible-directory-v1"
+LINK_PREFIX = "vless-mesh-ansible:"
 
 
 class PanelError(Exception):
@@ -158,6 +163,11 @@ def valid_port(value):
     return value
 
 
+def child_subscription_id(owner_token, email):
+    return hmac.new(owner_token.encode(), b'vless-mesh-child-subscription-v1\x00' + email.encode(),
+                    hashlib.sha256).hexdigest()[:40]
+
+
 def validate(params):
     url = urllib.parse.urlsplit(params["url"])
     if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
@@ -187,6 +197,20 @@ def validate(params):
             raise PanelError("user emails and UUIDs must be unique")
         emails.add(user["email"])
         identifiers.add(user["uuid"])
+    by_email = {user['email']: user for user in params['users']}
+    subscriptions = set()
+    for user in params['users']:
+        owner_name = user.get('subscription_owner') or user['email']
+        owner = by_email.get(owner_name)
+        if owner is None or (owner.get('subscription_owner') or owner['email']) != owner_name:
+            raise PanelError('subscription_owner must name a base user in this configuration')
+        if user['enabled'] != owner['enabled']:
+            raise PanelError('subscription identities must inherit their owner enabled state')
+        if owner_name != user['email']:
+            user['sub_id'] = child_subscription_id(owner['sub_id'], user['email'])
+        if user['sub_id'] in subscriptions:
+            raise PanelError('panel users require distinct subscription IDs')
+        subscriptions.add(user['sub_id'])
     securities = {endpoint["security"] for endpoint in params["ingress_endpoints"]}
     if not securities.issubset({"tls", "reality"}) or len(securities) != 1:
         raise PanelError("all managed endpoints must use one security profile: TLS or REALITY; mixed deployments require separate panels")
@@ -341,6 +365,67 @@ def differs(existing, desired):
     return any(existing.get(key) != value for key, value in desired.items())
 
 
+def external_link_payload(row):
+    return {key: row.get(key, default) for key, default in
+            [('kind', 'link'), ('value', ''), ('remark', ''), ('enable', True),
+             ('expiryTime', 0), ('namePrefix', '')]}
+
+
+def reconcile_subscription_links(module, panel, active_ids):
+    """Compose native child share links without fetching remote subscriptions."""
+    changed = False
+    for owner in module.params['users']:
+        if (owner.get('subscription_owner') or owner['email']) != owner['email']:
+            continue
+        children = [user for user in module.params['users']
+                    if user.get('subscription_owner') == owner['email'] and user['email'] != owner['email']]
+        path = urllib.parse.quote(owner['email'], safe='')
+        if module.check_mode:
+            records = panel.call('/panel/api/clients/list')
+            if not any(record['email'] == owner['email'] for record in records):
+                changed |= bool(children)
+                continue
+        detail = panel.call('/panel/api/clients/get/' + path)
+        rows = detail.get('externalLinks') or []
+        if not isinstance(rows, list):
+            raise PanelError('invalid external link list from panel')
+        preserved = [external_link_payload(row) for row in rows
+                     if not (row.get('kind') == 'link' and str(row.get('namePrefix', '')).startswith(LINK_PREFIX))]
+        desired = list(preserved)
+        for child in children:
+            child_path = urllib.parse.quote(child['email'], safe='')
+            if module.check_mode:
+                existing = next((record for record in records if record['email'] == child['email']), None)
+                if existing is None or set(existing.get('inboundIds', [])) != set(active_ids):
+                    changed = True
+                    continue
+            child_detail = panel.call('/panel/api/clients/get/' + child_path)
+            if set(child_detail.get('inboundIds', [])) != set(active_ids):
+                raise PanelError('grouped child must attach exclusively to the managed directory inbounds')
+            links = panel.call('/panel/api/clients/links/' + child_path)
+            if not isinstance(links, list) or not links:
+                raise PanelError('panel returned no generated child links')
+            seen = set()
+            for link in links:
+                parsed = urllib.parse.urlsplit(link)
+                if parsed.scheme != 'vless' or parsed.username != child['uuid']:
+                    raise PanelError('panel returned an unexpected generated child link')
+                if link in seen:
+                    continue
+                seen.add(link)
+                label = child['exit'] + ' via ' + str(parsed.hostname) + ':' + str(parsed.port)
+                named_link = link.split('#', 1)[0] + '#' + urllib.parse.quote(label, safe='')
+                desired.append({'kind': 'link', 'value': named_link, 'remark': label,
+                                'enable': child['enabled'], 'expiryTime': 0,
+                                'namePrefix': LINK_PREFIX + child['email']})
+        current = [external_link_payload(row) for row in rows]
+        if current != desired:
+            changed = True
+            if not module.check_mode:
+                panel.call('/panel/api/clients/' + path + '/externalLinks', {'externalLinks': desired})
+    return changed
+
+
 def reconcile(module, panel, proxies):
     params = module.params
     inbounds = panel.call("/panel/api/inbounds/list")
@@ -453,18 +538,20 @@ def reconcile(module, panel, proxies):
             if not module.check_mode:
                 panel.call("/panel/api/clients/add", {"client": owned, "inboundIds": active_ids})
         else:
-            normalized = dict(record, id=record.get("uuid"))
-            if differs(normalized, owned):
-                changed = True
-                if not module.check_mode:
-                    payload = client_payload(record)
-                    payload.update(owned)
-                    panel.call("/panel/api/clients/update/" + path_email, payload)
+            # 3x-ui normalizes flow against attached transports. Attach first so
+            # a TLS-to-REALITY migration retains Vision on this same reconcile.
             missing = [iid for iid in active_ids if iid is None or iid not in record.get("inboundIds", [])]
             if missing:
                 changed = True
                 if not module.check_mode:
                     panel.call("/panel/api/clients/" + path_email + "/attach", {"inboundIds": missing})
+            normalized = dict(record, id=record.get("uuid"))
+            if missing or differs(normalized, owned):
+                changed = True
+                if not module.check_mode:
+                    payload = client_payload(record)
+                    payload.update(owned)
+                    panel.call("/panel/api/clients/update/" + path_email, payload)
     for record in clients:
         if ownership(record) and record["email"] not in desired_by_email and record.get("enable", False):
             changed = True
@@ -472,6 +559,7 @@ def reconcile(module, panel, proxies):
                 payload = client_payload(record)
                 payload["enable"] = False
                 panel.call("/panel/api/clients/update/" + urllib.parse.quote(record["email"], safe=""), payload)
+    changed |= reconcile_subscription_links(module, panel, active_ids)
     settings = panel.call("/panel/api/setting/all", {})
     if not isinstance(settings, dict):
         raise PanelError("panel returned invalid settings")
@@ -500,6 +588,7 @@ def main():
             "email": {"type": "str", "required": True},
             "uuid": {"type": "str", "required": True, "no_log": True},
             "sub_id": {"type": "str", "required": True, "no_log": True},
+            "subscription_owner": {"type": "str"},
             "exit": {"type": "str", "required": True},
             "enabled": {"type": "bool", "default": True},
             "flow": {"type": "str", "choices": ["", "xtls-rprx-vision"]}}},

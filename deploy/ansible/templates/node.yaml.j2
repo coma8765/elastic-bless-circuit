@@ -54,7 +54,7 @@ exits:
     uuid_file: /run/secrets/{{ peer }}-uuid
 {% endfor %}
 routes:
-{% for user in vless_users %}
+{% for user in hostvars[groups.headscale[0]].managed_users %}
   {{ user.email | to_json }}: {{ user.exit | to_json }}
 {% endfor %}
 {% endif %}

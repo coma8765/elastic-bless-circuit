@@ -18,6 +18,7 @@ cmake --build build/ci --parallel 2
 "$ci_python" tests/reality_keys.py
 "$ci_python" tests/edge_modules.py
 "$ci_python" tests/build_staging.py
+"$ci_python" tests/user_routes.py
 for ci_inventory in inventory.local.yml inventory.example.yml; do
   for ci_playbook in site.yml build.yml; do
     ./scripts/ansible.sh -i "deploy/ansible/$ci_inventory" --syntax-check "deploy/ansible/$ci_playbook"
@@ -25,3 +26,4 @@ for ci_inventory in inventory.local.yml inventory.example.yml; do
 done
 ./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/external-edge.yml
 ./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/ingress-edge.yml
+./scripts/ansible.sh -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/prepare-exits.yml

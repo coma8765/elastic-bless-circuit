@@ -57,3 +57,5 @@ max_stale_seconds: 86400
 vless_users: []
 # Ansible owns these unlimited users; edit enabled here, not through competing UI automation.
 # - {email: alice-eu, exit: out-eu, enabled: true}
+# Optional additional_exits: [out-us, out-asia] adds exit identities to the same
+# subscription, retaining the base user's UUID and primary route.
