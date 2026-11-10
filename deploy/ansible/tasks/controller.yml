@@ -21,7 +21,7 @@
   ansible.builtin.assert:
     that:
       - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')
-  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress + (vless_users | map(attribute='email') | list) }}"
+  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress }}"
 - name: Validate user exit assignments
   ansible.builtin.assert:
     that: ["item.exit in groups.exits"]
@@ -47,7 +47,7 @@
   become: false
 - name: Persist UUID entropy and subscription tokens
   ansible.builtin.copy:
-    dest: "{{ controller_state_dir }}/users/{{ item.email }}.{{ suffix }}"
+    dest: "{{ controller_state_dir }}/users/{{ item.identity_key | default(item.email) }}.{{ suffix }}"
     content: "{{ (lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) | to_uuid) if suffix == 'uuid' else lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
     force: false
     mode: '0600'
@@ -59,7 +59,7 @@
   no_log: true
 - name: Persist subscription tokens
   ansible.builtin.copy:
-    dest: "{{ controller_state_dir }}/users/{{ item.email }}.sub"
+    dest: "{{ controller_state_dir }}/users/{{ item.identity_key | default(item.email) }}.sub"
     content: "{{ lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
     force: false
     mode: '0600'
@@ -85,7 +85,7 @@
   no_log: true
 - name: Assemble managed user identities
   ansible.builtin.set_fact:
-    managed_users: "{{ managed_users + [dict(email=item.email, subscription_owner=item.base_email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.base_email + '.sub'), enabled=item.enabled)] }}"
+    managed_users: "{{ managed_users + [dict(email=item.email, subscription_owner=item.base_email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + (item.identity_key | default(item.email)) + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + (item.base_identity_key | default(item.base_email)) + '.sub'), enabled=item.enabled) | combine({'expiry_time': item.expiry_time} if 'expiry_time' in item else {}) | combine({'metadata': item.metadata} if 'metadata' in item else {})] }}"
   loop: "{{ expanded_users }}"
   no_log: true
 - name: Validate ingress transport selection

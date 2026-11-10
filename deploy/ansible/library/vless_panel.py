@@ -153,8 +153,15 @@ def ownership(client):
     return isinstance(comment, dict) and comment.get("managed_by") == MANAGED
 
 
-def comment_for(exit_name):
-    return json.dumps({"managed_by": MANAGED, "exit": exit_name}, sort_keys=True, separators=(",", ":"))
+def comment_for(exit_name, metadata=None):
+    comment = {"managed_by": MANAGED, "exit": exit_name}
+    metadata = metadata or {}
+    if 'comment' in metadata:
+        comment['source_comment'] = metadata['comment']
+    audit = {key: metadata[key] for key in ['source_email', 'source_uuid', 'original_expiry_time', 'created_at', 'updated_at'] if key in metadata}
+    if audit:
+        comment['source_metadata'] = audit
+    return json.dumps(comment, sort_keys=True, separators=(",", ":"))
 
 
 def valid_port(value):
@@ -189,6 +196,10 @@ def validate(params):
     for user in params["users"]:
         if not user["email"] or not user["sub_id"] or not user["exit"]:
             raise PanelError("users require nonempty email, sub_id and exit")
+        if len(user['email']) > 255 or any(ord(char) < 32 or ord(char) == 127 or char.isspace() or char in '/\\' for char in user['email']):
+            raise PanelError('email contains characters unsupported by the panel API')
+        if any(ord(char) < 32 or ord(char) == 127 or char.isspace() or char in '/\\' for char in user['sub_id']):
+            raise PanelError('subscription ID contains characters unsupported by the panel API')
         try:
             user["uuid"] = str(uuid.UUID(user["uuid"]))
         except (ValueError, AttributeError):
@@ -197,6 +208,23 @@ def validate(params):
             raise PanelError("user emails and UUIDs must be unique")
         emails.add(user["email"])
         identifiers.add(user["uuid"])
+        expiry = user.get('expiry_time', 0)
+        if (not isinstance(expiry, int) or isinstance(expiry, bool) or not -(2 ** 63) <= expiry < 2 ** 63 or
+                (expiry < 0 and user['enabled'])):
+            raise PanelError('expiry_time must be milliseconds; first-use expiry requires a disabled account')
+        for field in ['totalGB', 'total_gb', 'limitIp', 'limit_ip', 'limitHwid', 'limit_hwid']:
+            if user.get(field, 0) != 0:
+                raise PanelError('quota and device limits require central accounting')
+        metadata = user.get('metadata', {})
+        if not isinstance(metadata, dict):
+            raise PanelError('metadata must be an object')
+        for key, value in metadata.items():
+            valid = (key in {'comment', 'group', 'password', 'auth', 'security', 'source_email', 'source_uuid'} and isinstance(value, str))
+            valid |= (key == 'tg_id' and isinstance(value, (str, int)) and not isinstance(value, bool) and
+                      re.fullmatch(r'-?[0-9]+', str(value)) is not None and -(2 ** 63) <= int(value) < 2 ** 63)
+            valid |= key in {'reset', 'original_expiry_time', 'created_at', 'updated_at'} and isinstance(value, int) and not isinstance(value, bool) and (key != 'reset' or value >= 0)
+            if not valid:
+                raise PanelError('unsupported metadata field or value type')
     by_email = {user['email']: user for user in params['users']}
     subscriptions = set()
     for user in params['users']:
@@ -206,6 +234,8 @@ def validate(params):
             raise PanelError('subscription_owner must name a base user in this configuration')
         if user['enabled'] != owner['enabled']:
             raise PanelError('subscription identities must inherit their owner enabled state')
+        if user.get('expiry_time', 0) != owner.get('expiry_time', 0):
+            raise PanelError('subscription identities must inherit their owner expiry_time')
         if owner_name != user['email']:
             user['sub_id'] = child_subscription_id(owner['sub_id'], user['email'])
         if user['sub_id'] in subscriptions:
@@ -528,10 +558,15 @@ def reconcile(module, panel, proxies):
         inbound_ids.update({name: iid for name in names})
     for email, desired in desired_by_email.items():
         record = by_email.get(email)
+        metadata = desired.get('metadata') or {}
         owned = {"email": email, "id": desired["uuid"], "subId": desired["sub_id"],
-                 "enable": desired["enabled"], "comment": comment_for(desired["exit"]),
+                 "enable": desired["enabled"], "comment": comment_for(desired["exit"], metadata),
                  "flow": desired.get("flow", "xtls-rprx-vision" if reality_mode else ""),
-                 "totalGB": 0, "expiryTime": 0, "limitIp": 0, "limitHwid": 0}
+                 "totalGB": 0, "expiryTime": desired.get('expiry_time', 0), "limitIp": 0, "limitHwid": 0}
+        for source, target in [('tg_id', 'tgId'), ('group', 'group'), ('password', 'password'),
+                               ('auth', 'auth'), ('security', 'security'), ('reset', 'reset')]:
+            if source in metadata:
+                owned[target] = int(metadata[source]) if source == 'tg_id' else metadata[source]
         path_email = urllib.parse.quote(email, safe="")
         if record is None:
             changed = True
@@ -591,6 +626,8 @@ def main():
             "subscription_owner": {"type": "str"},
             "exit": {"type": "str", "required": True},
             "enabled": {"type": "bool", "default": True},
+            "expiry_time": {"type": "int", "default": 0},
+            "metadata": {"type": "dict", "default": {}, "no_log": True},
             "flow": {"type": "str", "choices": ["", "xtls-rprx-vision"]}}},
         "ingress_endpoints": {"type": "list", "elements": "dict", "required": True, "options": {
             "address": {"type": "str", "required": True},

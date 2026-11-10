@@ -339,6 +339,83 @@ def run(engine, image):
         checks.append('disabling the base revokes every grouped identity while an unrelated subscription remains active')
         checks.append('native subscription composition preserves unrelated operator external links across choice edits')
 
+        # Imported accounts retain their existing protocol identity and base
+        # subscription token. Absolute expiry applies to every routed identity.
+        baseline_accounts = account_state()
+        imported = user('import@example.test')
+        imported.update(exit='out', expiry_time=4102444800000, metadata={
+            'comment': 'Original operator note', 'source_email': 'original display name', 'source_uuid': 'legacy-short-id',
+            'original_expiry_time': -7776000000, 'created_at': 1700000000000,
+            'updated_at': 1700000001000, 'tg_id': '123456789', 'group': '', 'reset': 0,
+            'password': 'retained-protocol-password', 'auth': 'retained-auth', 'security': 'auto'})
+        imported_child = user('import@example.test--prague')
+        imported_child.update(exit='prague', sub_id=imported['sub_id'],
+                              subscription_owner=imported['email'], expiry_time=imported['expiry_time'])
+        original_import_identity = (imported['uuid'], imported['sub_id'])
+        module.params['users'].extend([imported, imported_child])
+        assert reconcile()['changed'] and not reconcile()['changed'], 'import rerun changed preserved account data'
+        imported_path = '/panel/api/clients/get/' + urllib.parse.quote(imported['email'], safe='')
+        imported_record = client.call(imported_path)['client']
+        comment = json.loads(imported_record['comment'])
+        assert comment['source_comment'] == imported['metadata']['comment']
+        for key in ['source_email', 'source_uuid', 'original_expiry_time', 'created_at', 'updated_at']:
+            assert comment['source_metadata'][key] == imported['metadata'][key], 'source audit metadata was lost'
+        assert panel_module.ownership(imported_record), 'import metadata replaced the ownership marker'
+        for source_key, api_key in [('tg_id', 'tgId'), ('password', 'password'), ('auth', 'auth'),
+                                    ('security', 'security'), ('group', 'group'), ('reset', 'reset')]:
+            expected = int(imported['metadata'][source_key]) if source_key == 'tg_id' else imported['metadata'][source_key]
+            assert imported_record[api_key] == expected, 'source field was not preserved: ' + source_key
+        imported_rows = {row['email']: row for row in client.call('/panel/api/clients/list')}
+        assert all(imported_rows[row['email']]['expiryTime'] == imported['expiry_time'] for row in [imported, imported_child])
+        assert (imported_record['uuid'], imported_record['subId']) == original_import_identity
+        assert len(subscription(imported, {imported['uuid'], imported_child['uuid']})) == 4
+        assert all(account_state()[email] == state for email, state in baseline_accounts.items())
+        checks.append('imported identities, source metadata and absolute expiry persist across all exit choices and reruns')
+
+        blank_metadata = user('import-blank-metadata')
+        blank_metadata.update(metadata={'comment': '', 'tg_id': 0, 'group': '', 'reset': 0,
+                                        'password': '', 'auth': '', 'security': ''})
+        module.params['users'].append(blank_metadata)
+        assert reconcile()['changed'] and not reconcile()['changed'], 'empty imported metadata was not idempotent'
+        blank_record = client.call('/panel/api/clients/get/' + blank_metadata['email'])['client']
+        assert all(blank_record[key] == '' for key in ['password', 'auth', 'security', 'group'])
+        assert blank_record['tgId'] == 0 and blank_record['reset'] == 0
+        assert json.loads(blank_record['comment'])['source_comment'] == ''
+        checks.append('empty imported protocol metadata remains empty and idempotent')
+
+        disabled = user('import-disabled')
+        disabled.update(enabled=False, expiry_time=-2592000000,
+                        metadata={'comment': 'Awaiting first-use support', 'original_expiry_time': -2592000000})
+        disabled_child = user('import-disabled--prague')
+        disabled_child.update(enabled=False, expiry_time=disabled['expiry_time'], exit='prague',
+                              subscription_owner=disabled['email'], sub_id=disabled['sub_id'])
+        module.params['users'].extend([disabled, disabled_child])
+        assert reconcile()['changed'] and not reconcile()['changed']
+        stored = {row['email']: row for row in client.call('/panel/api/clients/list')}
+        assert all(not stored[row['email']]['enable'] and stored[row['email']]['expiryTime'] == -2592000000
+                   for row in [disabled, disabled_child]), 'disabled first-use policy was activated or erased'
+        disabled['enabled'] = disabled_child['enabled'] = True
+        try:
+            panel_module.validate(module.params)
+        except panel_module.PanelError:
+            pass
+        else:
+            raise AssertionError('unsupported active first-use policy passed validation')
+        disabled['enabled'] = disabled_child['enabled'] = False
+        assert not reconcile()['changed']
+        checks.append('disabled first-use policies remain disabled and retain their original duration; activation is rejected')
+
+        try:
+            client.call('/panel/api/clients/add', {'client': {
+                'email': 'invalid space', 'id': str(uuid.uuid4()), 'subId': secrets.token_urlsafe(24),
+                'enable': False}, 'inboundIds': [grouped_id]})
+        except panel_module.PanelError:
+            pass
+        else:
+            raise AssertionError('pinned panel unexpectedly accepted a whitespace email')
+        assert not any(row['email'] == 'invalid space' for row in client.call('/panel/api/clients/list'))
+        checks.append('pinned panel accepts preserved email addresses and rejects whitespace labels before adoption')
+
         for check in checks:
             print('PASS ' + check, flush=True)
         return checks

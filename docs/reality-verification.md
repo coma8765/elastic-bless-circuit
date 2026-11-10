@@ -8,8 +8,9 @@ Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The curren
 | `tests/ansible_modules.py` | 19 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI/public-origin validation, alias inheritance/collision checks and mixed-profile rejection |
 | `tests/reality_keys.py` | 11 | Persistent X25519 identities, private-file permissions, concurrent publication and key-pair consistency |
 | `tests/edge_modules.py` | 30 | Owned edge routes, quoted/case-insensitive SNI collision rejection, RFC1918 backend opt-in, subscription-only routing, separate certificate/hook ownership, check mode and rollback |
-| `tests/reality_panel.py` | 14 + cleanup | Actual 3x-ui APIs and generated subscriptions, public URL persistence, aliases, eight-profile exit choices, group revocation, operator-link preservation, migration and idempotence |
+| `tests/reality_panel.py` | 18 + cleanup | Actual 3x-ui APIs and generated subscriptions, public URL persistence, aliases, eight-profile exit choices, imported metadata/expiry, disabled first-use policy, revocation, migration and idempotence |
 | `tests/user_routes.py --with-renderer` | 9 | Pure route validation/HMAC contracts, actual controller identity persistence and pre-write rejection, grouped disable/remove/re-add, plus compiled renderer/Xray acceptance |
+| `tests/user_import.py` | 9 | Opaque state keys, seeded UUID/token preservation, exact supported emails, metadata/expiry inheritance, malformed policy rejection and actual controller reruns |
 | `tests/build_staging.py` | 1 | Three roles sharing one host: initial build, unchanged reruns, source/image upgrades and missing-image recovery |
 | `tests/container_overrides.py` | 2 engines | Actual Podman and Docker: DNS/hosts addition, removal and unchanged reruns using disposable containers |
 
@@ -29,7 +30,11 @@ The isolated panel integration verified:
 12. Removing/re-adding an exit choice retains its UUID and the base account's original subscription token.
 13. Disabling the base disables all four client identities and six managed static links; no child links are exported, and an unrelated subscription remains active. The panel may retain two disabled base-native links in its output; their presence is not evidence of authorization.
 14. Unrelated operator external links retain their supported fields across grouped changes, including rows with reserved-looking remarks but unowned `namePrefix` values.
-15. The uniquely named test container and private database volume are removed.
+15. Imported UUIDs and base subscription tokens remain unchanged while supported profile metadata and expiry persist through the real panel API.
+16. Nonnegative absolute expiry is inherited by every grouped identity, including unchanged reruns.
+17. Disabled negative first-use expiry remains preserved; enabling that unnormalized policy is rejected.
+18. Explicitly empty imported metadata stays empty and does not trigger repeated updates.
+19. The uniquely named test container and private database volume are removed.
 
 Reproduce from the repository root after installing the deployment's pinned Ansible requirements:
 
@@ -42,6 +47,7 @@ python3 tests/validate.py
 .local/ansible-venv/bin/python tests/build_staging.py
 .local/ansible-venv/bin/python tests/reality_panel.py
 .local/ansible-venv/bin/python tests/user_routes.py --with-renderer
+.local/ansible-venv/bin/python tests/user_import.py
 .local/ansible-venv/bin/python tests/container_overrides.py --engine podman
 ```
 
