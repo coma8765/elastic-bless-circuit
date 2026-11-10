@@ -7,6 +7,7 @@ SSH, reads live credentials, changes DNS or accesses the running deployment.
 import importlib.util
 import base64
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -120,6 +121,63 @@ class RouteSafety(unittest.TestCase):
     def test_existing_owned_route_is_idempotent(self):
         content = CONFIG.replace('  default 127.0.0.1:4089;', ADDITION + '  default 127.0.0.1:4089;')
         result = self.execute(content)
+        self.assertFalse(result['failed'])
+        self.assertFalse(result['result']['changed'])
+        self.assertEqual(result['content'], content)
+        self.assertIsNone(result['backup'])
+        self.assertFalse(any(c[1] == 'exec' for c in result['calls']))
+
+    def test_expected_previous_backend_replaces_only_one_token_and_preserves_inode(self):
+        for spelling in ['new.example.test 8.8.8.8:443;',
+                         '"NEW.EXAMPLE.TEST"\n # preserve this\n "8.8.8.8:443" ;']:
+            entry = '  ' + spelling + '\n'
+            content = CONFIG.replace('  default 127.0.0.1:4089;', entry + '  default 127.0.0.1:4089;')
+            for check in [False, True]:
+                result = self.execute(content, check=check, overrides={'previous_backend': '8.8.8.8:443'})
+                self.assertFalse(result['failed'])
+                self.assertTrue(result['result']['changed'])
+                expected = content.replace('"8.8.8.8:443"', '127.0.0.1:443').replace('8.8.8.8:443', '127.0.0.1:443')
+                self.assertEqual(result['content'], content if check else expected)
+                self.assertTrue(result['inode_unchanged'])
+                self.assertEqual(result['backup'], None if check else content)
+
+    def test_previous_backend_mismatch_missing_and_duplicate_routes_refuse_writes(self):
+        entry = '  new.example.test 8.8.8.8:443;\n'
+        for content in [CONFIG, CONFIG.replace('  default 127.0.0.1:4089;',
+                                               entry + '  default 127.0.0.1:4089;'),
+                        CONFIG.replace('  default 127.0.0.1:4089;',
+                                       entry + entry + '  default 127.0.0.1:4089;')]:
+            expected = '8.8.4.4:443' if content.count(entry) == 1 else '8.8.8.8:443'
+            result = self.execute(content, overrides={'previous_backend': expected})
+            self.assertTrue(result['failed'])
+            self.assertEqual(result['content'], content)
+            self.assertIsNone(result['backup'])
+            self.assertFalse(any(c[1] == 'exec' for c in result['calls']))
+
+    def test_previous_backend_is_strict_unicast_comparison_only(self):
+        for old in ['', '8.8.8.8:0', '8.8.8.8:65536', '::1:443', '0.0.0.0:443',
+                    '224.1.1.1:443', '255.255.255.255:443', '169.254.1.1:443',
+                    '8.8.8.8:443; injected']:
+            result = self.execute(overrides={'previous_backend': old})
+            self.assertTrue(result['failed'])
+            self.assertEqual(result['calls'], [])
+        # Public addresses may be compared, but never installed as desired backends.
+        result = self.execute(overrides={'previous_backend': '8.8.8.8:443', 'backend': '8.8.4.4:443'})
+        self.assertTrue(result['failed'])
+        self.assertEqual(result['calls'], [])
+
+    def test_expected_previous_replacement_validation_failure_rolls_back(self):
+        content = CONFIG.replace('existing.example.test 127.0.0.1:4443', 'new.example.test 8.8.8.8:443')
+        result = self.execute(content, reject_config=True, overrides={'previous_backend': '8.8.8.8:443'})
+        self.assertTrue(result['failed'])
+        self.assertEqual(result['content'], content)
+        self.assertEqual(result['backup'], content)
+        self.assertTrue(result['inode_unchanged'])
+        self.assertEqual([c[-1] for c in result['calls'] if c[1] == 'exec'], ['-t'])
+
+    def test_desired_backend_is_idempotent_after_expected_previous_transition(self):
+        content = CONFIG.replace('existing.example.test 127.0.0.1:4443', 'new.example.test 127.0.0.1:443')
+        result = self.execute(content, overrides={'previous_backend': '8.8.8.8:443'})
         self.assertFalse(result['failed'])
         self.assertFalse(result['result']['changed'])
         self.assertEqual(result['content'], content)
@@ -300,6 +358,36 @@ class EdgeTemplateScope(unittest.TestCase):
 
     def task(self, name):
         return next(task for task in self.tasks if task['name'] == name)
+
+    def test_dns_management_defaults_on_and_explicit_false_skips_only_record_task(self):
+        play = yaml.safe_load((ROOT / 'deploy/ansible/external-edge.yml').read_text())[0]
+        self.env.filters['bool'] = lambda value: value in (True, 1, 'true', 'yes')
+        setting = self.env.compile_expression(play['vars']['edge_manage_dns'][2:-2].strip())
+        condition = self.env.compile_expression(self.task('Create only the authorized DNS-only A record')['when'])
+        self.assertTrue(condition(edge_manage_dns=setting()))
+        self.assertFalse(condition(edge_manage_dns=setting(external_edge_manage_dns=False)))
+        for name in ['Issue or retain the isolated certificate using the existing ACME account',
+                     'Install and validate only this edge vhost']:
+            self.assertNotIn('when', self.task(name))
+        self.assertEqual(self.task('Add an explicitly authorized SNI route on an existing stream frontend')['when'],
+                         'external_edge_stream_config is defined')
+
+    def test_skipped_dns_audit_does_not_claim_a_record_was_read_or_changed(self):
+        self.env.filters['bool'] = bool
+        self.env.filters['to_nice_json'] = json.dumps
+        content = self.task('Preserve post-change audit and DNS status privately')['ansible.builtin.copy']['content']
+        expression = self.env.compile_expression(content[2:-2].strip())
+        common = {'edge_after': {'audit': {'verified': True}}}
+        skipped = json.loads(expression(**common, edge_manage_dns=False,
+                                                    edge_dns={'skipped': True, 'changed': False}))
+        self.assertFalse(skipped['dns_managed'])
+        self.assertFalse(skipped['dns_changed'])
+        self.assertIsNone(skipped['record'])
+        applied = json.loads(expression(**common, edge_manage_dns=True,
+                                                    edge_dns={'changed': True, 'record': {'type': 'A'}}))
+        self.assertTrue(applied['dns_managed'])
+        self.assertTrue(applied['dns_changed'])
+        self.assertEqual(applied['record'], {'type': 'A'})
 
     def test_default_combined_mode_keeps_the_existing_rendered_configuration(self):
         rendered = self.template.render(**self.context)

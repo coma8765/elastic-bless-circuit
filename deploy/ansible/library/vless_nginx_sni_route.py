@@ -30,13 +30,16 @@ options:
   backend:
     type: str
     required: true
+  previous_backend:
+    type: str
+    description: Replace one existing exact route only if it equals this expected IPv4 endpoint. Public unicast is permitted for comparison only.
   allow_private_backend:
     type: bool
     default: false
     description: Explicitly allow an IPv4 backend in RFC1918 space, in addition to 127.0.0.1.
 notes:
   - The existing map, its default and all other entries are preserved.
-  - Refuses an existing conflicting route for the requested hostname.
+  - Refuses an existing conflicting route unless previous_backend matches exactly; duplicate routes always fail closed.
   - Writes in place to preserve a single-file Docker bind mount's inode.
   - Validates nginx and gracefully reloads it; rolls back the file if validation fails.
 '''
@@ -69,6 +72,47 @@ def exact_routes(body, hostname):
     return matches
 
 
+def replacement_span(body, hostname):
+    """Locate the backend token without rewriting quotes, comments or whitespace."""
+    tokens, i = [], 0
+    while i < len(body):
+        if body[i].isspace():
+            i += 1
+            continue
+        if body[i] == '#':
+            newline = body.find('\n', i)
+            i = len(body) if newline < 0 else newline + 1
+            continue
+        if body[i] == ';':
+            if tokens and tokens[0][0].casefold() == hostname.casefold():
+                if len(tokens) != 2:
+                    raise RouteError('requested hostname has an unsupported SNI route')
+                return tokens[1][1:]
+            tokens = []
+            i += 1
+            continue
+        start, quote = i, None
+        while i < len(body):
+            char = body[i]
+            if char == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in "\"'":
+                quote = char
+            elif char.isspace() or char in ';#':
+                break
+            i += 1
+        raw = body[start:i]
+        decoded = shlex.split(raw, comments=False, posix=True)
+        if len(decoded) != 1:
+            raise RouteError('selected map has unsupported token spelling')
+        tokens.append((decoded[0], start, i))
+    raise RouteError('could not locate the expected existing SNI route')
+
+
 def main():
     m = AnsibleModule(argument_spec={
         'path': {'type': 'path', 'required': True},
@@ -76,6 +120,7 @@ def main():
         'map_variable': {'type': 'str', 'required': True},
         'hostname': {'type': 'str', 'required': True},
         'backend': {'type': 'str', 'required': True},
+        'previous_backend': {'type': 'str'},
         'allow_private_backend': {'type': 'bool', 'default': False},
     }, supports_check_mode=True)
     try:
@@ -96,6 +141,17 @@ def main():
         if address != ipaddress.IPv4Address('127.0.0.1') and not (
                 p.get('allow_private_backend', False) and any(address in network for network in private_ranges)):
             raise RouteError('backend must be 127.0.0.1, or an explicitly enabled RFC1918 IPv4 address')
+        previous = p.get('previous_backend')
+        if previous is not None:
+            try:
+                old_host, old_port = previous.rsplit(':', 1)
+                old_address = ipaddress.IPv4Address(old_host)
+                if (not re.fullmatch(r'[0-9]{1,5}', old_port) or not 1 <= int(old_port) <= 65535
+                        or old_address.is_unspecified or old_address.is_multicast
+                        or old_address.is_reserved or old_address.is_link_local):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise RouteError('previous_backend must be an IPv4 unicast address and port in 1..65535')
         if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', p['container']):
             raise RouteError('invalid container name')
 
@@ -121,15 +177,23 @@ def main():
             body = original[start:end]
             existing = exact_routes(body, p['hostname'])
             if existing:
-                if len(existing) != 1 or existing[0] != p['backend']:
+                if len(existing) != 1:
+                    raise RouteError('requested hostname has duplicate SNI routes')
+                if existing[0] == p['backend']:
+                    m.exit_json(changed=False)
+                if previous is None or existing[0] != previous:
                     raise RouteError('requested hostname already has a conflicting SNI route')
-                m.exit_json(changed=False)
-            defaults = list(re.finditer(r'(?m)^([ \t]*)default\s+[^;]+;[^\r\n]*$', body))
-            if len(defaults) != 1:
-                raise RouteError('expected exactly one default route')
-            position = start + defaults[0].start()
-            addition = defaults[0].group(1) + p['hostname'] + ' ' + p['backend'] + ';\n'
-            updated = original[:position] + addition + original[position:]
+                left, right = replacement_span(body, p['hostname'])
+                updated = original[:start + left] + p['backend'] + original[start + right:]
+            else:
+                if previous is not None:
+                    raise RouteError('expected previous SNI route is absent')
+                defaults = list(re.finditer(r'(?m)^([ \t]*)default\s+[^;]+;[^\r\n]*$', body))
+                if len(defaults) != 1:
+                    raise RouteError('expected exactly one default route')
+                position = start + defaults[0].start()
+                addition = defaults[0].group(1) + p['hostname'] + ' ' + p['backend'] + ';\n'
+                updated = original[:position] + addition + original[position:]
             if m.check_mode:
                 m.exit_json(changed=True)
             backup = path.with_name(path.name + '.vless-edge-before')

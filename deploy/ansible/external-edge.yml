@@ -12,6 +12,7 @@
     edge_headscale_upstream: "{{ external_edge_headscale_upstream | default('127.0.0.1:18081') }}"
     edge_sub_upstream: "{{ external_edge_subscription_upstream | default('127.0.0.1:2096') }}"
     edge_subscription_only: "{{ external_edge_subscription_only | default(false) | bool }}"
+    edge_manage_dns: "{{ external_edge_manage_dns | default(true) | bool }}"
     edge_lineage: "/etc/letsencrypt/live/{{ edge_cert_name }}"
     edge_audit_dir: "{{ external_edge_audit_dir | default(playbook_dir + '/../../.local/live') }}"
   tasks:
@@ -146,6 +147,7 @@
         ipv4: "{{ external_edge_ipv4 }}"
         credentials_file: "{{ external_edge_cf_credentials }}"
       register: edge_dns
+      when: edge_manage_dns | bool
       no_log: true
     - name: Inspect the owned certificate before issuance
       ansible.builtin.stat:
@@ -231,7 +233,7 @@
           changed_when: false
         - name: Report the failed edge activation
           ansible.builtin.fail:
-            msg: Edge activation failed; previous nginx configuration was restored. DNS/certificate remain available for retry.
+            msg: Edge activation failed; previous nginx configuration was restored. Certificate and any previously applied DNS change remain available for retry.
     - name: Add an explicitly authorized SNI route on an existing stream frontend
       vless_nginx_sni_route:
         path: "{{ external_edge_stream_config }}"
@@ -239,6 +241,7 @@
         map_variable: "{{ external_edge_stream_map }}"
         hostname: "{{ external_edge_domain }}"
         backend: "{{ external_edge_stream_backend | default('127.0.0.1:443') }}"
+        previous_backend: "{{ external_edge_stream_previous_backend | default(omit) }}"
       when: external_edge_stream_config is defined
       register: edge_stream_route
       no_log: true
@@ -248,7 +251,7 @@
       no_log: true
     - name: Preserve post-change audit and DNS status privately
       ansible.builtin.copy:
-        content: "{{ {'audit': edge_after.audit, 'dns_changed': edge_dns.changed, 'record': edge_dns.record} | to_nice_json }}"
+        content: "{{ {'audit': edge_after.audit, 'dns_managed': edge_manage_dns | bool, 'dns_changed': edge_dns.changed | default(false), 'record': edge_dns.record | default(none)} | to_nice_json }}"
         dest: "{{ edge_audit_dir }}/edge-result.json"
         mode: '0600'
       delegate_to: localhost
