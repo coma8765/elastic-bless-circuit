@@ -5,6 +5,9 @@
     docker_host: '{{ docker_host }}'
     state: started
     restart_policy: always
+    memory: "{{ node_memory | default(omit) }}"
+    memory_swap: "{{ node_memory_swap | default(omit) }}"
+    pids_limit: "{{ node_pids_limit | default(omit) }}"
     recreate: '{{ node_config.changed or mesh_secret.changed or mesh_ca.changed or panel_secrets.changed or transit_secret.changed
       or ingress_transit.changed or ingress_certs.changed or ingress_reality.changed }}'
     pull: never

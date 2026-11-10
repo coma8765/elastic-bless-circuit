@@ -1,6 +1,21 @@
 - name: Select exit role when not supplied by caller
   ansible.builtin.set_fact:
     node_role: '{{ node_role | default(''out'') }}'
+- name: Validate optional Docker node resource limits
+  ansible.builtin.assert:
+    that:
+    - node_memory is not defined or (node_memory is string and node_memory is match('^[1-9][0-9]*[mMgG]$'))
+    - node_memory_swap is not defined or (node_memory is defined and node_memory_swap is string and node_memory_swap is match('^[1-9][0-9]*[mMgG]$'))
+    - node_pids_limit is not defined or (node_pids_limit is integer and node_pids_limit >= 1 and node_pids_limit <= 65535)
+    fail_msg: Docker node limits require positive m/g memory strings, swap requires memory, and pids must be an integer in 1..65535.
+  when: container_engine == 'docker'
+- name: Validate Docker node memory and combined memory-swap bounds
+  ansible.builtin.assert:
+    that:
+    - (node_memory | human_to_bytes) >= 6291456
+    - node_memory_swap is not defined or (node_memory_swap | default(node_memory) | human_to_bytes) >= (node_memory | human_to_bytes)
+    fail_msg: Node memory must be at least 6 MiB; combined memory-swap must not be smaller than memory.
+  when: container_engine == 'docker' and node_memory is defined
 - name: Install only this node's mesh enrollment key
   ansible.builtin.copy:
     src: '{{ controller_state_dir }}/enrollment/{{ inventory_hostname }}.key'

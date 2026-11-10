@@ -61,7 +61,9 @@ options:
 notes:
   - subscription_owner groups child identities through native external links; child backend subscription IDs are derived from the unchanged owner token.
   - Static external-link namePrefix values beginning vless-mesh-ansible: are reserved; unrelated rows are preserved.
-  - Each ingress endpoint may include aliases containing address, port and remark; aliases inherit its security profile and use the same directory.
+  - Each ingress endpoint may include aliases containing address, port, remark and optional display_country; aliases inherit its security profile and use the same directory.
+  - Optional endpoint display_country and user exit_display_country produce exact country route names through owned native static external links.
+  - advertise=false prepares a directory and membership without publishing its endpoints; at least one endpoint must remain advertised.
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
   - Removed managed clients are disabled globally but remain in the panel for audit.
@@ -175,6 +177,34 @@ def child_subscription_id(owner_token, email):
                     hashlib.sha256).hexdigest()[:40]
 
 
+def country_labels(params):
+    """Opt-in display metadata never changes stable inventory/user identity."""
+    def country(value):
+        if not isinstance(value, str) or len(value) > 64 or value != value.strip() or '->' in value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise PanelError('display countries must be bounded plain labels without arrows or control characters')
+        return value
+    ingress, exits = {}, {}
+    for endpoint in params['ingress_endpoints']:
+        primary = country(endpoint.get('display_country', ''))
+        for advertised in [endpoint] + (endpoint.get('aliases') or []):
+            label = country(primary if advertised.get('display_country') is None else advertised.get('display_country', primary))
+            host = advertised['address']
+            host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else host.lower()
+            ingress[(host, valid_port(advertised['port']))] = label
+    for user in params['users']:
+        label = country(user.get('exit_display_country', ''))
+        if user['exit'] in exits and exits[user['exit']] != label:
+            raise PanelError('one exit must have one consistent display country')
+        exits[user['exit']] = label
+    enabled = any(ingress.values()) or any(exits.values())
+    if enabled:
+        if not all(ingress.values()) or not all(exits.values()):
+            raise PanelError('country labels require every advertised ingress and user exit to be labeled')
+        if len(set(ingress.values())) != len(ingress) or len(set(exits.values())) != len(exits):
+            raise PanelError('country labels must distinguish every ingress address and exit')
+    return enabled, ingress, exits
+
+
 def validate(params):
     url = urllib.parse.urlsplit(params["url"])
     if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
@@ -252,6 +282,10 @@ def validate(params):
         if flow not in ("", "xtls-rprx-vision") or (reality_mode and flow != "xtls-rprx-vision"):
             raise PanelError("REALITY users require xtls-rprx-vision; unsupported user flow")
         user["flow"] = flow
+    if not any(endpoint.get('advertise', True) is True for endpoint in params['ingress_endpoints']):
+        raise PanelError('at least one ingress endpoint must be advertised')
+    if any(not isinstance(endpoint.get('advertise', True), bool) for endpoint in params['ingress_endpoints']):
+        raise PanelError('endpoint advertise must be a boolean')
     proxies = []
     endpoint_keys = set()
     profile_names = set()
@@ -262,7 +296,7 @@ def validate(params):
             raise PanelError("endpoint aliases must be a list")
         alias_labels = set()
         for alias in aliases:
-            if not isinstance(alias, dict) or set(alias) != {"address", "port", "remark"}:
+            if not isinstance(alias, dict) or not {"address", "port", "remark"}.issubset(alias) or set(alias) - {"address", "port", "remark", "display_country"}:
                 raise PanelError("aliases require only address, port and remark")
             label = alias["remark"]
             if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label) or label in alias_labels or label == endpoint.get("remark"):
@@ -302,6 +336,7 @@ def validate(params):
             proxies.append({"dest": address, "port": endpoint["port"],
                             "remark": endpoint["remark"], "forceTls": "tls",
                             "sni": endpoint.get("tls_server_name") or address})
+    country_labels(params)
     return proxies
 
 
@@ -404,11 +439,21 @@ def external_link_payload(row):
 def reconcile_subscription_links(module, panel, active_ids):
     """Compose native child share links without fetching remote subscriptions."""
     changed = False
+    exact_labels, ingress_countries, exit_countries = country_labels(module.params)
+    published = set()
+    for endpoint in module.params['ingress_endpoints']:
+        if endpoint.get('advertise', True):
+            for advertised in [endpoint] + (endpoint.get('aliases') or []):
+                host = advertised['address']
+                host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else host.lower()
+                published.add((host, advertised['port']))
     for owner in module.params['users']:
         if (owner.get('subscription_owner') or owner['email']) != owner['email']:
             continue
         children = [user for user in module.params['users']
                     if user.get('subscription_owner') == owner['email'] and user['email'] != owner['email']]
+        if exact_labels:
+            children = [owner] + children
         path = urllib.parse.quote(owner['email'], safe='')
         if module.check_mode:
             records = panel.call('/panel/api/clients/list')
@@ -436,18 +481,35 @@ def reconcile_subscription_links(module, panel, active_ids):
             if not isinstance(links, list) or not links:
                 raise PanelError('panel returned no generated child links')
             seen = set()
+            published_seen = set()
             for link in links:
                 parsed = urllib.parse.urlsplit(link)
                 if parsed.scheme != 'vless' or parsed.username != child['uuid']:
                     raise PanelError('panel returned an unexpected generated child link')
-                if link in seen:
+                host = parsed.hostname
+                host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else str(host).lower()
+                if (host, parsed.port) not in ingress_countries:
+                    raise PanelError('panel returned a generated link outside the configured ingress endpoints')
+                if (host, parsed.port) not in published or link in seen:
                     continue
                 seen.add(link)
-                label = child['exit'] + ' via ' + str(parsed.hostname) + ':' + str(parsed.port)
+                endpoint_key = (host, parsed.port)
+                if endpoint_key in published_seen:
+                    raise PanelError('panel returned ambiguous generated links for one published ingress endpoint')
+                published_seen.add(endpoint_key)
+                if exact_labels:
+                    country = ingress_countries.get((host, parsed.port))
+                    if country is None:
+                        raise PanelError('panel returned a generated link outside the configured ingress endpoints')
+                    label = country + ' -> ' + exit_countries[child['exit']]
+                else:
+                    label = child['exit'] + ' via ' + str(parsed.hostname) + ':' + str(parsed.port)
                 named_link = link.split('#', 1)[0] + '#' + urllib.parse.quote(label, safe='')
                 desired.append({'kind': 'link', 'value': named_link, 'remark': label,
                                 'enable': child['enabled'], 'expiryTime': 0,
                                 'namePrefix': LINK_PREFIX + child['email']})
+            if published_seen != published:
+                raise PanelError('panel generated links do not cover every published ingress endpoint')
         current = [external_link_payload(row) for row in rows]
         if current != desired:
             changed = True
@@ -484,6 +546,7 @@ def reconcile(module, panel, proxies):
             raise PanelError("unmanaged clients are attached to a managed directory; preserve them in a separate inbound")
     reality_mode = params["ingress_endpoints"][0]["security"] == "reality"
     specs = []
+    hide_after_links = set()
     used_ports = {entry["port"] for entry in inbounds}
     for index, endpoint in enumerate(params["ingress_endpoints"] if reality_mode else [None]):
         remark = DIRECTORY + ":" + endpoint["remark"] if reality_mode else DIRECTORY
@@ -496,12 +559,19 @@ def reconcile(module, panel, proxies):
         used_ports.add(listen_port)
         stream = directory_stream(endpoint, proxies[index], existing) if reality_mode else {
             "network": "tcp", "security": "none", "externalProxy": [
-                advertised for physical, primary in zip(params["ingress_endpoints"], proxies)
+                advertised for physical, primary in zip(params["ingress_endpoints"], proxies) if physical.get("advertise", True)
                 for advertised in endpoint_proxies(physical, primary)]}
         desired = {"remark": remark, "listen": "127.0.0.1", "port": listen_port,
                    "protocol": "vless", "streamSettings": stream, "disableFlow": False,
                    "sniffing": {"enabled": False}, "expiryTime": 0, "total": 0,
-                   "excludeFromSub": False}
+                   "excludeFromSub": country_labels(params)[0] or (endpoint is not None and not endpoint.get("advertise", True))}
+        # Keep existing native entries available until their replacements exist.
+        # New unpublished directories are hidden immediately.
+        if (country_labels(params)[0] and existing is not None
+                and not existing.get("excludeFromSub", False)
+                and (endpoint is None or endpoint.get("advertise", True))):
+            desired["excludeFromSub"] = False
+            hide_after_links.add(existing["id"])
         names = [endpoint["remark"]] if reality_mode else [e.get("remark") or (e["address"] + ":" + str(e["port"])) for e in params["ingress_endpoints"]]
         specs.append((desired, existing, names))
     changed, inbound_ids, active_ids = False, {}, []
@@ -595,6 +665,25 @@ def reconcile(module, panel, proxies):
                 payload["enable"] = False
                 panel.call("/panel/api/clients/update/" + urllib.parse.quote(record["email"], safe=""), payload)
     changed |= reconcile_subscription_links(module, panel, active_ids)
+    if hide_after_links:
+        changed = True
+        if not module.check_mode:
+            # Client attachment/update changes inbound settings; never send the
+            # pre-reconcile snapshot back over the newly installed identities.
+            fresh = panel.call("/panel/api/inbounds/list")
+            if not isinstance(fresh, list):
+                raise PanelError('invalid refreshed inbound list')
+            pending = set(hide_after_links)
+            for inbound in fresh:
+                if inbound.get('id') in pending:
+                    if not owned_directory(inbound):
+                        raise PanelError('directory ownership changed during subscription migration')
+                    payload = copy.deepcopy(inbound)
+                    payload['excludeFromSub'] = True
+                    panel.call('/panel/api/inbounds/update/' + str(inbound['id']), payload)
+                    pending.remove(inbound['id'])
+            if pending:
+                raise PanelError('managed directory disappeared during subscription migration')
     settings = panel.call("/panel/api/setting/all", {})
     if not isinstance(settings, dict):
         raise PanelError("panel returned invalid settings")
@@ -625,6 +714,7 @@ def main():
             "sub_id": {"type": "str", "required": True, "no_log": True},
             "subscription_owner": {"type": "str"},
             "exit": {"type": "str", "required": True},
+            "exit_display_country": {"type": "str", "default": ""},
             "enabled": {"type": "bool", "default": True},
             "expiry_time": {"type": "int", "default": 0},
             "metadata": {"type": "dict", "default": {}, "no_log": True},
@@ -633,10 +723,13 @@ def main():
             "address": {"type": "str", "required": True},
             "port": {"type": "int", "required": True},
             "remark": {"type": "str", "default": ""},
+            "display_country": {"type": "str", "default": ""},
+            "advertise": {"type": "bool", "default": True},
             "aliases": {"type": "list", "elements": "dict", "default": [], "options": {
                 "address": {"type": "str", "required": True},
                 "port": {"type": "int", "required": True},
-                "remark": {"type": "str", "required": True}}},
+                "remark": {"type": "str", "required": True},
+                "display_country": {"type": "str"}}},
             "security": {"type": "str", "default": "tls", "choices": ["tls", "reality"]},
             "tls_server_name": {"type": "str"},
             "reality_server_name": {"type": "str"},

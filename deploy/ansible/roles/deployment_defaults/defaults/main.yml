@@ -14,6 +14,8 @@ docker_host: unix:///var/run/docker.sock
 container_dns_servers: []
 container_extra_hosts: {}
 container_cli_environment: "{{ {'DOCKER_HOST': docker_host} if container_engine == 'docker' else {} }}"
+# Optional Docker-only node_memory, node_memory_swap and node_pids_limit stay
+# undefined so existing containers retain their resource settings.
 docker_minimum_version: '20.10'
 podman_minimum_version: '4.9'
 prepare_images_by_role: true
@@ -49,6 +51,10 @@ ingress_reality_fingerprint: chrome
 ingress_port: 443
 ingress_public_port: 443
 ingress_advertised_aliases: []
+# Optional client-visible country names; inventory names remain stable.
+ingress_advertised: true
+ingress_display_country: ""
+exit_display_country: ""
 ingress_publish: ["443:443/tcp"]
 transit_port: 8443
 allow_private_destinations: false

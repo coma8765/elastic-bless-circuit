@@ -190,9 +190,40 @@ Update managed clients by stable email and preserve existing UUIDs. Removing an 
 
 For imported accounts, an optional `identity_key` separates safe controller filenames from the exact panel email. It defaults to the email for legacy safe labels; use an explicit unique label of at most 64 letters, digits, dots, underscores or hyphens for emails such as `user@example.com`. Seed the original UUID and subscription token in `users/<identity_key>.uuid` and `users/<identity_key>.sub` before reconciliation. Existing files are preserved. Child state keys append `--<exit>` and must also fit 64 characters; collision and path validation runs before secret writes. The panel API rejects whitespace, control characters and slashes in email labels. If a legacy account uses one, choose an explicit alias and retain its original label in `metadata.source_email`; do not silently change its UUID or token.
 
+To give every subscription entry an exact country route label, set `ingress_display_country` on each ingress host and `exit_display_country` on each exit host. These optional display names are separate from stable inventory names, directory remarks and user identities. Once any display country is configured, every configured ingress address (including staged hosts) and used exit must have a bounded, nonempty, unique country label. The resulting name is exactly `<ingress country> -> <exit country>`, including the base account's original exit. Aliases may set their own `display_country`; duplicate display names are refused. Without display countries, the existing subscription naming behavior remains unchanged.
+
+Country labeling uses the panel's native authenticated share-link generator and composes owned static links for both the base identity and its additional exits. Managed directory inbounds remain enabled and retain membership, but `excludeFromSub` suppresses their automatically named duplicates. When migrating from legacy naming, existing native entries remain available until all replacement static links have been installed; exclusion then uses freshly read inbound settings so new memberships are preserved. Unrelated external links are preserved. Account disable/expiry applies to the composed subscription without changing any UUID or public subscription token.
+
+New ingress hosts can be enrolled and attached before publication: set `ingress_advertised: false` on each unready host. Its directory and user membership are prepared, but its addresses are omitted from subscription output in both naming modes. At least one ingress must remain advertised. Verify the new ingress's direct traffic, authentication, private-destination policy and REALITY metadata before setting `ingress_advertised: true`. Removing a LAN entry means removing that advertised address or alias from YAML; it does not require replacing the physical ingress or its identity. Four published ingress addresses with four exit identities produce sixteen managed choices for each enabled account.
+
+For example, merge these illustrative values into the existing `ingress` and `exits` group host entries; retain all other hosts, connection settings and transport configuration:
+
+```yaml
+ingress:
+  hosts:
+    in:                         # Existing stable inventory name
+      ingress_display_country: Sweden
+      ingress_advertised_aliases: []
+    in-de:                      # New logical ingress host
+      ingress_display_country: Germany
+      ingress_public_address: in-de.example.net
+      ingress_public_port: 8443
+      ingress_publish: ["8443:443/tcp"]
+      ingress_advertised_aliases: []
+      ingress_advertised: false  # Stage, deploy and verify before publication
+exits:
+  hosts:
+    out:                        # Existing stable exit name
+      exit_display_country: Finland
+```
+
+Give every other ingress and used exit its own display country too. Keep at least the existing public ingress advertised. The chosen public TCP port must be free on the new physical host, reachable through its firewall, and match `ingress_public_port` and `ingress_publish`; an existing OUT host does not need a second OUT container to gain a separate IN role. After direct traffic and rejection checks pass, change only `in-de`'s `ingress_advertised` to `true` and reconcile. This adds entries such as `Germany -> Finland`. Preserve existing inventory names, `vless_users`, controller state files and subscription tokens throughout. Empty alias lists publish no additional LAN address; replace any unwanted primary LAN address with the intended public address as well.
+
 Optional `expiry_time` carries an absolute Unix timestamp in milliseconds to the base and all exit identities; zero means no expiry. A negative first-use duration is accepted only for a disabled account, retaining the original policy without activating it. Normalize it to an explicit absolute expiry before enabling. Nonzero traffic quotas or device limits are rejected because remote ingress has no central accounting. Do not convert unsupported limits to unlimited access during import.
 
 Base-only `metadata` can preserve `comment`, `tg_id`, `group`, `password`, `auth`, `security` and `reset`. String fields remain strings, `tg_id` accepts an int64 integer or decimal string (normalized to a native integer), and `reset` must be a nonnegative integer. Audit fields `source_email`, `source_uuid`, `original_expiry_time`, `created_at` and `updated_at` can retain the legacy label and policy/timestamps. The original comment is nested as `source_comment` in the module's ownership JSON; audit fields appear under `source_metadata`. Keep these fields in private inventory so future reconciliation preserves them. Imported counters can be restored separately through the panel API; reconciliation does not reset them, and displayed counters do not enforce quotas across remote nodes. Private exports and backups should retain any source fields not represented by this schema.
+
+Optional Docker-only host variables `node_memory`, `node_memory_swap` and `node_pids_limit` bound the managed node container. They remain omitted by default, preserving existing resource settings. Memory values use positive `m` or `g` units (at least 6 MiB); `node_memory_swap` is Docker's combined RAM-plus-swap limit and must be at least `node_memory`. For example, `node_memory: 128m`, `node_memory_swap: 256m`, `node_pids_limit: 128` permits 128 MiB RAM and up to another 128 MiB swap when the host supports it. These settings do not create host swap, cap runtime-daemon memory, or replace capacity monitoring. Apply limits to each logical ingress/exit host separately and measure under expected load before lowering them.
 
 Production containers use the selected engine's restart policy. Docker enables its daemon at boot; Podman enables `podman-restart.service`. The local Podman test exercises container creation, configuration, enrollment, synchronization, subscriptions and rerun behavior. It does not verify Debian package installation, SSH transport, host firewall rules or recovery across a production host reboot. Verify those on a representative Debian host before rollout.
 
