@@ -17,6 +17,10 @@ panel_settings:
 listener: {address: mesh, port: {{ transit_port }}}
 transit_uuid_file: /run/secrets/transit-uuid
 allow_private_destinations: {{ allow_private_destinations | bool | lower }}
+{% if exit_dns_servers | default([]) | length > 0 %}
+dns:
+  servers: {{ exit_dns_servers | to_json }}
+{% endif %}
 {% else %}
 sync_seconds: {{ sync_seconds }}
 max_stale_seconds: {{ max_stale_seconds }}

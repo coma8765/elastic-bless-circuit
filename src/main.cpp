@@ -296,6 +296,42 @@ static bool ip_literal(const std::string &name) {
   return inet_pton(AF_INET, name.c_str(), &ipv4) == 1 ||
          inet_pton(AF_INET6, name.c_str(), &ipv6) == 1;
 }
+static J exit_dns_servers(const YAML::Node &config) {
+  const auto dns = config["dns"];
+  if (!dns)
+    return J::array();
+  if (config["role"].as<std::string>() != "out" || !dns.IsMap() ||
+      dns.size() != 1 || !dns["servers"] || !dns["servers"].IsSequence() ||
+      dns["servers"].size() == 0 || dns["servers"].size() > 4)
+    throw std::runtime_error("dns requires an out node and 1..4 public IPv4 servers");
+  J servers = J::array();
+  std::set<std::string> unique;
+  for (const auto &node : dns["servers"]) {
+    const auto server = node.as<std::string>();
+    in_addr address{};
+    if (inet_pton(AF_INET, server.c_str(), &address) != 1)
+      throw std::runtime_error("DNS servers must be public IPv4 literals");
+    const auto ip = ntohl(address.s_addr);
+    // Conservatively exclude private, shared, link-local, documentation,
+    // benchmarking, multicast and reserved destinations from resolver choices.
+    if ((ip >> 24) == 0 || (ip >> 24) == 10 || (ip >> 24) == 127 ||
+        (ip >> 24) >= 224 || (ip & 0xffc00000U) == 0x64400000U ||
+        (ip & 0xffff0000U) == 0xa9fe0000U ||
+        (ip & 0xfff00000U) == 0xac100000U ||
+        (ip & 0xffffff00U) == 0xc0000000U ||
+        (ip & 0xffffff00U) == 0xc0000200U ||
+        (ip & 0xffffff00U) == 0xc0586300U ||
+        (ip & 0xffff0000U) == 0xc0a80000U ||
+        (ip & 0xfffe0000U) == 0xc6120000U ||
+        (ip & 0xffffff00U) == 0xc6336400U ||
+        (ip & 0xffffff00U) == 0xcb007100U)
+      throw std::runtime_error("DNS servers must be public IPv4 literals");
+    if (!unique.insert(server).second)
+      throw std::runtime_error("duplicate DNS server");
+    servers.push_back(server);
+  }
+  return servers;
+}
 static void reality_stream(const YAML::Node &c, J &stream) {
   if (stream.value("security", "none") != "reality")
     return;
@@ -367,6 +403,7 @@ static J render(const YAML::Node &c, const J &users) {
     throw std::runtime_error("role must be in or out");
   if (!users.is_array())
     throw std::runtime_error("users must be an array");
+  const auto dns_servers = exit_dns_servers(c);
   J root = {{"log", {{"loglevel", "warning"}}},
             {"inbounds", J::array()},
             {"outbounds", J::array()}};
@@ -396,6 +433,13 @@ static J render(const YAML::Node &c, const J &users) {
     root["outbounds"].push_back({{"tag", "internet"},
                                  {"protocol", "freedom"},
                                  {"settings", J::object()}});
+    if (!dns_servers.empty()) {
+      root["dns"] = {{"servers", dns_servers},
+                     {"queryStrategy", "UseIPv4"},
+                     {"disableCache", false}};
+      root["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"] =
+          "ForceIPv4";
+    }
     if (c["allow_private_destinations"].as<bool>(false))
       root["outbounds"][0]["settings"]["finalRules"] = J::array(
           {{{"action", "allow"}, {"ip", J::array({"geoip:private"})}}});

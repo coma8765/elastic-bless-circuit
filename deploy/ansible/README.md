@@ -118,6 +118,10 @@ Logical inventory host names must remain distinct even when their `ansible_host`
 
 For a LAN whose router caches stale DNS or lacks NAT loopback, optional per-host `container_dns_servers: ["1.1.1.1", "8.8.8.8"]` and `container_extra_hosts: {"mesh.example.com": "192.0.2.10"}` apply only inside that host's managed containers. Leave their defaults (`[]` and `{}`) to retain engine DNS behavior. A split-DNS mapping changes the connection address while keeping the original HTTPS hostname/SNI and certificate validation; it does not change host DNS or solve public WAN forwarding. Configure only the hosts that need the override.
 
+Exit nodes can separately opt into Xray's IPv4-only DNS cache with host-level `exit_dns_servers: ["1.1.1.1", "8.8.8.8"]`. The default empty list preserves existing resolution. This renders exit YAML `dns: {servers: [...]}` and accepts one to four distinct public IPv4 resolver addresses; private, shared, reserved and nonliteral addresses are rejected. Cached answers follow their DNS TTL. No DNS listener or public port is created, and host/container system DNS settings remain unchanged.
+
+This option uses `ForceIPv4` on the Freedom outbound, so routing checks, final destination checks and dialing share Xray's DNS cache. DNS failure fails closed instead of falling back to the system resolver, and IPv6-only destinations are unavailable while enabled. Existing private-destination routing and Freedom safety rules remain in force. Without this option, the pinned core can resolve a domain separately during routing, Freedom's safety precheck and system dialing; its default `localhost` DNS client does not cache. See the [pinned Freedom implementation](https://github.com/XTLS/Xray-core/blob/v26.11.9/proxy/freedom/freedom.go#L322) and [DNS localhost implementation](https://github.com/XTLS/Xray-core/blob/v26.11.9/app/dns/nameserver_local.go#L41). Measure resolver latency and repeated-request performance before enabling it. This cache does not affect REALITY's separate camouflage-target resolver.
+
 ## REALITY with Vision
 
 The TLS profile remains the default. To select REALITY for a managed deployment, set:

@@ -338,6 +338,60 @@ class RendererContracts(unittest.TestCase):
             {'type': 'field', 'ip': ['geoip:private'], 'outboundTag': 'block'}])
         self.assertEqual(result['outbounds'][0]['protocol'], 'freedom')
 
+    def test_exit_dns_is_opt_in_and_legacy_resolution_remains_unchanged(self):
+        result = self.render(egress(), xray_validate=True)
+        self.assertNotIn('dns', result)
+        self.assertEqual(result['outbounds'][0], {
+            'tag': 'internet', 'protocol': 'freedom', 'settings': {}})
+
+    def test_exit_dns_cache_uses_public_ipv4_resolvers_without_weakening_policy(self):
+        for servers in [['1.1.1.1'], ['1.1.1.1', '8.8.8.8', '9.9.9.9', '8.8.4.4']]:
+            with self.subTest(servers=servers):
+                config = egress()
+                config['dns'] = {'servers': servers}
+                result = self.render(config, xray_validate=True)
+                self.assertEqual(result['dns'], {
+                    'servers': servers, 'queryStrategy': 'UseIPv4', 'disableCache': False})
+                self.assertEqual(result['outbounds'][0]['streamSettings']['sockopt']['domainStrategy'],
+                                 'ForceIPv4')
+                self.assertEqual(result['inbounds'][0]['settings']['clients'], [{'id': TRANSIT_UUID}])
+                self.assertEqual(result['inbounds'][0]['listen'], '100.64.0.2')
+                self.assertEqual(result['routing']['rules'], [
+                    {'type': 'field', 'ip': ['geoip:private'], 'outboundTag': 'block'}])
+                self.assertEqual(result['outbounds'][1], {'tag': 'block', 'protocol': 'blackhole'})
+                self.assertEqual(result['outbounds'][0]['settings'], {})
+
+    def test_exit_dns_rejects_malformed_empty_oversized_or_duplicate_configuration(self):
+        invalid = [None, [], '', '1.1.1.1', {}, {'servers': None}, {'servers': []},
+                   {'servers': '1.1.1.1'}, {'servers': {'address': '1.1.1.1'}},
+                   {'servers': ['1.1.1.1', '1.1.1.1']},
+                   {'servers': ['1.1.1.1', '8.8.8.8', '9.9.9.9', '8.8.4.4', '1.0.0.1']},
+                   {'servers': ['1.1.1.1'], 'disableCache': True}]
+        for dns in invalid:
+            with self.subTest(dns=dns):
+                config = egress()
+                config['dns'] = dns
+                self.render(config, valid=False)
+
+    def test_exit_dns_rejects_nonpublic_literals_and_external_resolution_syntax(self):
+        invalid = [None, True, 1, ['1.1.1.1'], {'address': '1.1.1.1'}, '', 'localhost',
+                   'https://dns.example.com/dns-query', '1.1.1.1:53', '1.1.1.01', '::1',
+                   '2606:4700:4700::1111', '0.0.0.0', '10.0.0.1', '127.0.0.1',
+                   '100.64.0.1', '100.127.255.254', '169.254.1.1', '172.16.0.1',
+                   '172.31.255.254', '192.168.1.1', '192.0.0.1', '192.0.2.1',
+                   '192.88.99.1', '198.18.0.1', '198.19.255.254', '198.51.100.1',
+                   '203.0.113.1', '224.0.0.1', '239.1.2.3', '240.0.0.1', '255.255.255.255']
+        for server in invalid:
+            with self.subTest(server=server):
+                config = egress()
+                config['dns'] = {'servers': [server]}
+                self.render(config, valid=False)
+
+    def test_ingress_cannot_enable_exit_dns_or_change_pinned_mesh_resolution(self):
+        config = ingress()
+        config['dns'] = {'servers': ['1.1.1.1']}
+        self.render(config, valid=False)
+
     def test_exit_binding_is_limited_to_the_mesh_cgnat_range(self):
         for address in ['0.0.0.0', '127.0.0.1', '100.1.0.2', '100.63.255.255',
                         '100.128.0.1', '192.168.1.1', '::', 'not-an-ip']:

@@ -1,10 +1,11 @@
 # REALITY configuration and subscription verification
 
-Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The current 28-contract renderer suite and isolated panel tests passed locally on ARM64. The earlier 27-contract suite also passed against the rebuilt amd64 Docker image on a managed server through Ansible. Renderer tests use disposable containers, and panel integration uses a fresh isolated database. The original local fixtures were temporarily stopped to free compile memory, then restored with their original container identities and both authenticated routes reverified; the expanded local deployment remained running.
+Verified with the pinned Xray 26.11.9 and 3x-ui 3.11.0 on 2026-11-10. The current 33-contract renderer suite and isolated DNS runtime canary passed against the rebuilt amd64 image under local Podman emulation. The preceding 28-contract renderer and isolated panel suites passed on ARM64; an earlier 27-contract suite also passed natively with Docker through Ansible. Renderer tests use disposable containers, panel integration uses a fresh isolated database, and the DNS canary has no external network. During the original REALITY build, local fixtures were temporarily stopped to free compile memory, then restored with their original container identities and both authenticated routes reverified; the expanded local deployment remained running.
 
 | Suite | Passed | Scope |
 | --- | ---: | --- |
-| `tests/validate.py` | 28 | Compiled ARM64 image: C++ renderer, REALITY key-file substitution, Vision flow, YAML mesh UDP port bounds, input rejection and real `xray run -test` |
+| `tests/validate.py` | 33 | Compiled amd64 image: C++ renderer, REALITY/Vision, mesh UDP bounds, optional public IPv4 DNS cache configuration, input rejection, unchanged private-address policy and real `xray run -test` |
+| `tests/exit_dns_runtime.py` | 5 + cleanup | Isolated reachable HTTP/DNS canaries: authenticated transit, cache reuse and TTL refresh, private and mixed-answer denial, invalid UUID rejection and removal of both containers |
 | `tests/ansible_modules.py` | 19 | Certificate/panel validation, REALITY metadata, stable independent control keys, target/SNI/public-origin validation, alias inheritance/collision checks and mixed-profile rejection |
 | `tests/reality_keys.py` | 11 | Persistent X25519 identities, private-file permissions, concurrent publication and key-pair consistency |
 | `tests/edge_modules.py` | 30 | Owned edge routes, quoted/case-insensitive SNI collision rejection, RFC1918 backend opt-in, subscription-only routing, separate certificate/hook ownership, check mode and rollback |
@@ -30,8 +31,8 @@ The isolated panel integration verified:
 12. Removing/re-adding an exit choice retains its UUID and the base account's original subscription token.
 13. Disabling the base disables all four client identities and six managed static links; no child links are exported, and an unrelated subscription remains active. The panel may retain two disabled base-native links in its output; their presence is not evidence of authorization.
 14. Unrelated operator external links retain their supported fields across grouped changes, including rows with reserved-looking remarks but unowned `namePrefix` values.
-15. Imported UUIDs and base subscription tokens remain unchanged while supported profile metadata and expiry persist through the real panel API.
-16. Nonnegative absolute expiry is inherited by every grouped identity, including unchanged reruns.
+15. Imported UUIDs and base subscription tokens remain unchanged while supported profile metadata and absolute expiry persist through the real panel API and every grouped identity, including unchanged reruns.
+16. Supported email addresses remain unchanged; the pinned API rejects whitespace labels, requiring an explicit legacy alias.
 17. Disabled negative first-use expiry remains preserved; enabling that unnormalized policy is rejected.
 18. Explicitly empty imported metadata stays empty and does not trigger repeated updates.
 19. The uniquely named test container and private database volume are removed.
@@ -41,6 +42,8 @@ Reproduce from the repository root after installing the deployment's pinned Ansi
 ```sh
 CONTAINER_ENGINE=podman BUILD_IMAGES='node control' ./scripts/build.sh
 python3 tests/validate.py
+podman pull docker.io/library/python:3.13-slim
+python3 tests/exit_dns_runtime.py
 .local/ansible-venv/bin/python tests/ansible_modules.py
 .local/ansible-venv/bin/python tests/reality_keys.py
 .local/ansible-venv/bin/python tests/edge_modules.py
@@ -51,11 +54,13 @@ python3 tests/validate.py
 .local/ansible-venv/bin/python tests/container_overrides.py --engine podman
 ```
 
-To use an already built test image, set `NODE_IMAGE` for the renderer suite or pass `--image` to the panel suite. The latter also accepts `--engine docker` for a local Docker daemon. It publishes only random loopback ports, generates all credentials in memory, and does not read credentials from existing deployments.
+To use an already built test image, set `NODE_IMAGE` for the renderer and DNS runtime suites or pass `--image` to the panel suite. The panel also accepts `--engine docker` for a local Docker daemon. It publishes only random loopback ports, generates all credentials in memory, and does not read credentials from existing deployments.
+
+The DNS runtime suite requires the official Python image to be cached; it never pulls an image itself. Two disposable containers share a `network=none` namespace and publish no host ports. The fixture assigns a synthetic public address only inside that namespace, with `NET_ADMIN` for that setup and `NET_BIND_SERVICE` for the local DNS listener. The compiled exit configuration must reach a known HTTP canary with a valid transit UUID, reuse DNS answers across fresh connections, and query again after a two-second TTL. Private literals, private-only DNS answers and both orders of mixed public/private answers must produce no HTTP requests at the reachable private canary. A wrong transit UUID must fail while the authorized control still works. Both containers and temporary state are removed, including on failures. Use `CONTAINER_ENGINE=docker` for a local Docker daemon.
 
 The override regression requires the Debian stable-slim image to be present and creates one uniquely labeled sleeping container without ports or volumes. Use `--engine docker` for a local Docker daemon, or additionally supply `--ssh-target user@host` and optionally `--ssh-port` for an explicitly selected Docker host. It verifies the real resolver/hosts files and container identity, then removes only its owned fixture. Both engines passed during PR review.
 
-The fast quality CI runs REALITY identity, edge-module and shared-host build contracts. The real container/panel integration runs only in the manually dispatched integration workflow, where Ansible dependencies and built images are available. Raw integration logs and generated credentials are not uploaded.
+The fast quality CI runs REALITY identity, edge-module and shared-host build contracts. The real container/panel integration and isolated DNS canary run only in the manually dispatched integration workflow, which prepares the official Python fixture image alongside the built service images. Raw integration logs and generated credentials are not uploaded.
 
 This evidence proves configuration acceptance and real subscription/control behavior. The isolated panel suite does not authenticate a REALITY data-plane session to the camouflage target, test external firewall/NAT rules, or prove target compatibility. Those require a separate client-to-ingress-to-exit traffic test against the actual deployment. Default TLS behavior remains covered by the same renderer tests and the panel suite's TLS migration case.
 
