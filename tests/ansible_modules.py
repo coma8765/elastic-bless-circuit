@@ -497,6 +497,115 @@ class CountryLabels(unittest.TestCase):
         self.assertFalse(any(isinstance(event, tuple) and event[1]['excludeFromSub']
                              for event in migration_state['events']))
 
+    def route_filtered_fixture(self):
+        params = self.fixture()
+        for index, endpoint in enumerate(params['ingress_endpoints']):
+            endpoint['subscription_exits'] = [] if index == 0 else ['exit-' + str(index)]
+        panel.validate(params)
+        return params
+
+    def test_route_filters_publish_seven_exact_routes_and_restore_empty_default(self):
+        params = self.route_filtered_fixture()
+        users_before = copy.deepcopy(params['users'])
+        api, state, operator = self.fake(params)
+        module = types.SimpleNamespace(check_mode=False, params=params)
+        legacy_params = copy.deepcopy(params)
+        for endpoint in legacy_params['ingress_endpoints']:
+            endpoint['subscription_exits'] = []
+        panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=legacy_params), api, [1, 2, 3, 4])
+        self.assertEqual(len(state['external']) - len(operator), 16)
+        self.assertTrue(panel.reconcile_subscription_links(module, api, [1, 2, 3, 4]))
+        owned = state['external'][len(operator):]
+        labels = {'Russia -> ' + country for country in ['Kyrgyzstan', 'Czechia', 'Germany', 'Singapore']}
+        labels.update(country + ' -> ' + country for country in ['Czechia', 'Germany', 'Singapore'])
+        self.assertEqual(len(owned), 7)
+        self.assertEqual({row['remark'] for row in owned}, labels)
+        self.assertEqual(state['external'][:len(operator)], operator)
+        self.assertEqual(sum(row['namePrefix'] == panel.LINK_PREFIX + 'owner' for row in owned), 1,
+                         'the base account bypassed its ingress filter')
+        original_uris = {link.split('#', 1)[0] for links in state['generated'].values() for link in links}
+        self.assertTrue({row['value'].split('#', 1)[0] for row in owned} <= original_uris)
+        self.assertEqual(params['users'], users_before)
+        self.assertFalse(panel.reconcile_subscription_links(module, api, [1, 2, 3, 4]))
+        for endpoint in params['ingress_endpoints']:
+            endpoint['subscription_exits'] = []
+        panel.validate(params)
+        self.assertTrue(panel.reconcile_subscription_links(module, api, [1, 2, 3, 4]))
+        self.assertEqual(len(state['external']) - len(operator), 16)
+        self.assertEqual(params['users'], users_before)
+        self.assertFalse(panel.reconcile_subscription_links(module, api, [1, 2, 3, 4]))
+
+    def test_route_filters_reject_invalid_values_and_unlabeled_native_bypass(self):
+        for value in [None, 'exit-1', {}, ['exit-1', 'exit-1'], ['unknown'], [False], [None], ['../exit-1']]:
+            params = self.route_filtered_fixture()
+            params['ingress_endpoints'][1]['subscription_exits'] = value
+            with self.subTest(value=value), self.assertRaises(panel.PanelError):
+                panel.validate(params)
+        params = self.route_filtered_fixture()
+        for endpoint in params['ingress_endpoints']:
+            endpoint['display_country'] = ''
+        for user in params['users']:
+            user['exit_display_country'] = ''
+        with self.assertRaisesRegex(panel.PanelError, 'country labels'):
+            panel.validate(params)
+
+    def test_zero_eligible_child_is_valid_but_zero_profile_owner_is_rejected(self):
+        params = self.route_filtered_fixture()
+        for endpoint in params['ingress_endpoints']:
+            endpoint['subscription_exits'] = ['exit-1']
+        panel.validate(params)
+        api, state, _ = self.fake(params, operator=False)
+        panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=params), api, [1, 2, 3, 4])
+        self.assertEqual(len(state['external']), 4)
+        self.assertTrue(all(row['namePrefix'] == panel.LINK_PREFIX + 'owner--exit-1' for row in state['external']))
+        isolated = copy.deepcopy(params)
+        isolated['users'] = [isolated['users'][0], dict(isolated['users'][1],
+            email='separate-owner', subscription_owner='separate-owner', sub_id='separate-owner-token')]
+        with self.assertRaisesRegex(panel.PanelError, 'no published profiles'):
+            panel.validate(isolated)
+
+    def test_filtered_disabled_group_keeps_all_selected_links_disabled(self):
+        params = self.route_filtered_fixture()
+        for user in params['users']:
+            user['enabled'] = False
+        before = copy.deepcopy(params['users'])
+        api, state, operator = self.fake(params)
+        panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=params), api, [1, 2, 3, 4])
+        self.assertEqual(len(state['external']), len(operator) + 7)
+        self.assertEqual(state['external'][0], operator[0])
+        self.assertTrue(all(not row['enable'] for row in state['external'][len(operator):]))
+        self.assertEqual(params['users'], before)
+
+    def test_filtered_routes_still_validate_generated_credentials_and_completeness(self):
+        for failure in ['missing_allowed', 'ambiguous_allowed', 'wrong_uuid_excluded', 'unknown_endpoint_excluded']:
+            params = self.route_filtered_fixture()
+            api, state, operator = self.fake(params)
+            links = state['generated']['owner']
+            if failure == 'missing_allowed':
+                links.pop(0)
+            elif failure == 'ambiguous_allowed':
+                links.append(links[0].split('#', 1)[0] + '#different')
+            elif failure == 'wrong_uuid_excluded':
+                links[-1] = links[-1].replace(params['users'][0]['uuid'], str(uuid.UUID(int=99)))
+            else:
+                links[-1] = links[-1].replace('ingress-3.example.com', 'unknown.example.com')
+            with self.subTest(failure=failure), self.assertRaises(panel.PanelError):
+                panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=params), api, [1, 2, 3, 4])
+            self.assertEqual(state['calls'], [])
+            self.assertEqual(state['external'], operator)
+        params = self.route_filtered_fixture()
+        api, state, operator = self.fake(params)
+        state['generated']['owner'].append(state['generated']['owner'][0])
+        panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=params), api, [1, 2, 3, 4])
+        self.assertEqual(len(state['external']) - len(operator), 7, 'an exact duplicate URI was not deduplicated')
+
+        params = self.route_filtered_fixture()
+        api, state, operator = self.fake(params)
+        state['generated']['owner'].pop()  # Excluded Singapore endpoint for the Kyrgyzstan base identity.
+        panel.reconcile_subscription_links(types.SimpleNamespace(check_mode=False, params=params), api, [1, 2, 3, 4])
+        self.assertEqual(len(state['external']) - len(operator), 7)
+
+
 
 class NodeResourceOmission(unittest.TestCase):
     """Evaluate actual role limits through local Ansible without any engine call."""

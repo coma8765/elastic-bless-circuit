@@ -63,6 +63,7 @@ notes:
   - Static external-link namePrefix values beginning vless-mesh-ansible: are reserved; unrelated rows are preserved.
   - Each ingress endpoint may include aliases containing address, port, remark and optional display_country; aliases inherit its security profile and use the same directory.
   - Optional endpoint display_country and user exit_display_country produce exact country route names through owned native static external links.
+  - Optional subscription_exits selects published exit identities per physical ingress; empty means all, aliases inherit, and nonempty filters require country labels.
   - advertise=false prepares a directory and membership without publishing its endpoints; at least one endpoint must remain advertised.
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
@@ -336,7 +337,28 @@ def validate(params):
             proxies.append({"dest": address, "port": endpoint["port"],
                             "remark": endpoint["remark"], "forceTls": "tls",
                             "sni": endpoint.get("tls_server_name") or address})
-    country_labels(params)
+    labeled, _, _ = country_labels(params)
+    known_exits = {user['exit'] for user in params['users']}
+    for endpoint in params['ingress_endpoints']:
+        allowed = endpoint.get('subscription_exits', [])
+        if (not isinstance(allowed, list) or any(not isinstance(name, str) or
+                not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', name) for name in allowed)
+                or len(set(allowed)) != len(allowed)):
+            raise PanelError('subscription_exits must be a list of distinct stable exit names')
+        if allowed and not labeled:
+            raise PanelError('subscription_exits filters require complete country labels to suppress native subscription routes')
+        if known_exits and set(allowed) - known_exits:
+            raise PanelError('subscription_exits references an unknown configured user exit')
+    for owner in params['users']:
+        if (owner.get('subscription_owner') or owner['email']) != owner['email']:
+            continue
+        owner_exits = {user['exit'] for user in params['users']
+                       if (user.get('subscription_owner') or user['email']) == owner['email']}
+        if not any(endpoint.get('advertise', True) and
+                   (not endpoint.get('subscription_exits', []) or
+                    owner_exits.intersection(endpoint['subscription_exits']))
+                   for endpoint in params['ingress_endpoints']):
+            raise PanelError('subscription exit filters would leave an owner with no published profiles')
     return proxies
 
 
@@ -441,12 +463,15 @@ def reconcile_subscription_links(module, panel, active_ids):
     changed = False
     exact_labels, ingress_countries, exit_countries = country_labels(module.params)
     published = set()
+    endpoint_exits = {}
     for endpoint in module.params['ingress_endpoints']:
         if endpoint.get('advertise', True):
             for advertised in [endpoint] + (endpoint.get('aliases') or []):
                 host = advertised['address']
                 host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else host.lower()
-                published.add((host, advertised['port']))
+                key = (host, advertised['port'])
+                published.add(key)
+                endpoint_exits[key] = endpoint.get('subscription_exits', [])
     for owner in module.params['users']:
         if (owner.get('subscription_owner') or owner['email']) != owner['email']:
             continue
@@ -468,6 +493,7 @@ def reconcile_subscription_links(module, panel, active_ids):
                      if not (row.get('kind') == 'link' and str(row.get('namePrefix', '')).startswith(LINK_PREFIX))]
         desired = list(preserved)
         for child in children:
+            expected = {key for key in published if not endpoint_exits[key] or child['exit'] in endpoint_exits[key]}
             child_path = urllib.parse.quote(child['email'], safe='')
             if module.check_mode:
                 existing = next((record for record in records if record['email'] == child['email']), None)
@@ -490,7 +516,7 @@ def reconcile_subscription_links(module, panel, active_ids):
                 host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else str(host).lower()
                 if (host, parsed.port) not in ingress_countries:
                     raise PanelError('panel returned a generated link outside the configured ingress endpoints')
-                if (host, parsed.port) not in published or link in seen:
+                if (host, parsed.port) not in expected or link in seen:
                     continue
                 seen.add(link)
                 endpoint_key = (host, parsed.port)
@@ -508,7 +534,7 @@ def reconcile_subscription_links(module, panel, active_ids):
                 desired.append({'kind': 'link', 'value': named_link, 'remark': label,
                                 'enable': child['enabled'], 'expiryTime': 0,
                                 'namePrefix': LINK_PREFIX + child['email']})
-            if published_seen != published:
+            if published_seen != expected:
                 raise PanelError('panel generated links do not cover every published ingress endpoint')
         current = [external_link_payload(row) for row in rows]
         if current != desired:
@@ -725,6 +751,7 @@ def main():
             "remark": {"type": "str", "default": ""},
             "display_country": {"type": "str", "default": ""},
             "advertise": {"type": "bool", "default": True},
+            "subscription_exits": {"type": "list", "elements": "str", "default": []},
             "aliases": {"type": "list", "elements": "dict", "default": [], "options": {
                 "address": {"type": "str", "required": True},
                 "port": {"type": "int", "required": True},

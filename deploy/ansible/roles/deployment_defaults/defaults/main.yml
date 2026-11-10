@@ -53,6 +53,8 @@ ingress_public_port: 443
 ingress_advertised_aliases: []
 # Optional client-visible country names; inventory names remain stable.
 ingress_advertised: true
+# Empty advertises every user exit; nonempty requires country display labels.
+ingress_subscription_exits: []
 ingress_display_country: ""
 exit_display_country: ""
 ingress_publish: ["443:443/tcp"]
