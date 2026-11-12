@@ -124,7 +124,8 @@
           - image
           - inspect
           - --format
-          - '{{ "{{ index .Config.Labels \"" + capability + "\" }}" }}'
+          - >-
+            {{ '{{ index .Config.Labels ' ~ (capability | to_json) ~ ' }}' }}
           - '{{ control_image if inventory_hostname in groups.control else node_image }}'
       vars:
         capability: "{{ 'io.vless.single-client-subscriptions' if inventory_hostname in groups.control else 'io.vless.single-client-routing' }}"

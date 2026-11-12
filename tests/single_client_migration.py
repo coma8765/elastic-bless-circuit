@@ -110,6 +110,31 @@ class Migration(unittest.TestCase):
                 with contextlib.closing(sqlite3.connect(target)) as db:
                     self.assertEqual(db.execute('SELECT value FROM clients').fetchone(), ('written during WAL mode',))
 
+    def test_runtime_receives_a_valid_docker_label_expression(self):
+        plays = yaml.safe_load((DEPLOY / 'migrate-single-client.yml').read_text())
+        check = next(p for p in plays if p['name'].startswith('Prepare and verify'))['tasks']
+        with tempfile.TemporaryDirectory() as work:
+            directory = Path(work)
+            engine = directory / 'inspect-image'
+            engine.write_text("""#!/usr/bin/env python3
+import sys
+label = 'subscriptions' if sys.argv[-1] == 'panel-img' else 'routing'
+expected = '{{ index .Config.Labels "io.vless.single-client-' + label + '" }}'
+assert sys.argv[1:5] == ['image', 'inspect', '--format', expected]
+print('1')
+""")
+            engine.chmod(0o700)
+            inventory = directory / 'inventory.yml'
+            inventory.write_text(yaml.safe_dump({'all': {'vars': {
+                'ansible_connection': 'local', 'ansible_python_interpreter': '{{ ansible_playbook_python }}',
+                'ansible_remote_tmp': str(directory / 'tmp'), 'control_image': 'panel-img',
+                'node_image': 'node-img', 'container_engine': str(engine), 'container_cli_environment': {},
+            }, 'children': {'control': {'hosts': {'panel-host': {}}}, 'ingress': {'hosts': {'reader': {}}}}}}))
+            play = directory / 'play.yml'
+            play.write_text(yaml.safe_dump([{'hosts': 'control:ingress', 'gather_facts': False, 'tasks': check}]))
+            result = playbook('-i', inventory, play)
+            self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_valid_backup(self):
         self.backup(False)
 
