@@ -11,6 +11,23 @@
       - vless_users | map(attribute='email') | unique | length == vless_users | length
       - not ansible_check_mode
     fail_msg: "Use the complete inventory; initial provisioning cannot run in check mode."
+- name: Validate panel client mode and migration intent
+  ansible.builtin.assert:
+    that:
+      - panel_client_mode | default('grouped') in ['grouped', 'single']
+      - not (migrate_single_clients | default(false) | bool) or panel_client_mode == 'single'
+- name: Validate stable native VLESS route selectors
+  ansible.builtin.assert:
+    that:
+      - vless_route_selectors is mapping
+      - (vless_route_selectors.keys() | sort) == (groups.exits | sort)
+      - (vless_route_selectors.values() | select('integer') | list | length) == (groups.exits | length)
+      - (vless_route_selectors.values() | unique | length) == (groups.exits | length)
+      - vless_route_selectors.values() | min >= 16384
+      - vless_route_selectors.values() | max <= 20479
+      - groups.ingress | map('extract', hostvars, 'ingress_security') | unique | list == ['reality']
+    fail_msg: Single-client mode requires REALITY inbounds and a unique stable UUID-v4 selector (16384..20479) for every exit.
+  when: panel_client_mode | default('grouped') == 'single'
 - name: Validate stable mesh hostnames
   ansible.builtin.assert:
     that:
@@ -95,6 +112,23 @@
   ansible.builtin.set_fact:
     managed_users: "{{ managed_users + [dict(email=item.email, subscription_owner=item.base_email, exit=item.exit, exit_display_country=hostvars[item.exit].exit_display_country | default(''), uuid=lookup('file', controller_state_dir + '/users/' + (item.identity_key | default(item.email)) + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + (item.base_identity_key | default(item.base_email)) + '.sub'), enabled=item.enabled) | combine({'expiry_time': item.expiry_time} if 'expiry_time' in item else {}) | combine({'metadata': item.metadata} if 'metadata' in item else {})] }}"
   loop: "{{ expanded_users }}"
+  no_log: true
+- name: Prepare owner-bound credentials for previously downloaded profiles
+  vless_single_client_legacy:
+    users: '{{ managed_users }}'
+    selectors: '{{ vless_route_selectors }}'
+    path: '{{ controller_state_dir }}/single-client-legacy.json'
+    migrate: '{{ migrate_single_clients | default(false) | bool }}'
+  delegate_to: localhost
+  become: false
+  register: single_client_manifest
+  when: panel_client_mode | default('grouped') == 'single'
+  no_log: true
+- name: Read the private compatibility manifest for the ingress configuration
+  ansible.builtin.set_fact:
+    single_client_legacy:
+      owners: "{{ (lookup('ansible.builtin.file', controller_state_dir + '/single-client-legacy.json') | from_json) if single_client_manifest.present else [] }}"
+  when: panel_client_mode | default('grouped') == 'single'
   no_log: true
 - name: Validate ingress transport selection
   ansible.builtin.assert:

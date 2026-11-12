@@ -1,0 +1,190 @@
+---
+- name: Validate the complete rolling migration inventory
+  hosts: headscale:control:exits:ingress
+  gather_facts: false
+  any_errors_fatal: true
+  roles: [deployment_defaults]
+  tasks:
+    - name: Require the live deployment, an explicit migration and every logical host
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - panel_client_mode == 'single'
+          - migrate_single_clients | bool
+          - single_client_migration_phase | default('stage') in ['stage', 'cutover']
+          - (groups.headscale + groups.control + groups.exits + groups.ingress) | difference(ansible_play_hosts_all) | length == 0
+          - groups.headscale | length == 1 and groups.control | length == 1
+          - groups.ingress | length > 0 and groups.exits | length > 0
+        fail_msg: Use the full existing inventory, panel_client_mode=single and migrate_single_clients=true. Stage is the default phase.
+
+- name: Back up the live control database before changing deployment state
+  hosts: control
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/container-ownership.yml
+      vars:
+        owned_container_name: '{{ container_name }}'
+    - ansible.builtin.assert:
+        that: candidate_container_owner.rc == 0
+        fail_msg: Migration requires an existing control container. Use site.yml for a fresh installation.
+    - ansible.builtin.include_tasks: tasks/single-client-backup.yml
+
+- name: Preserve the active configuration and exact running image IDs
+  hosts: control:ingress
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/container-ownership.yml
+      vars:
+        owned_container_name: '{{ container_name }}'
+    - name: Read the image ID of each live container
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', container, inspect, --format, '{{ "{{.Image}}" }}', '{{ container_name }}']
+      environment: '{{ container_cli_environment }}'
+      register: migration_image
+      changed_when: false
+    - name: Save the original image ID alongside the SQLite backup
+      ansible.builtin.copy:
+        content: '{{ migration_image.stdout | trim }}{{ "\n" }}'
+        dest: '{{ hostvars[groups.control[0]].recovery_point.path }}/{{ inventory_hostname }}.image'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+    - name: Save each live node configuration in the private recovery directory
+      ansible.builtin.fetch:
+        src: '{{ node_dir }}/config.yaml'
+        dest: '{{ hostvars[groups.control[0]].recovery_point.path }}/{{ inventory_hostname }}.yaml'
+        flat: true
+      no_log: true
+
+- name: Load the existing controller identities and validate the compatibility manifest
+  hosts: headscale
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify the private keys for the running mesh already exist
+      ansible.builtin.stat:
+        path: '{{ controller_state_dir }}/{{ item }}'
+        get_checksum: false
+        get_mime: false
+      vars:
+        enrollment_files: "{{ (groups.control + groups.ingress) | map('regex_replace', '^(.*)$', 'enrollment/\\1.key') | list }}"
+        transit_files: "{{ groups.exits | map('regex_replace', '^(.*)$', 'transit/\\1.uuid') | list }}"
+        reality_files: "{{ groups.ingress | map('regex_replace', '^(.*)$', 'reality/\\1.json') | list }}"
+      loop: '{{ enrollment_files + transit_files + reality_files }}'
+      register: existing_identity
+      failed_when: not existing_identity.stat.isreg | default(false) or existing_identity.stat.size | int == 0
+      delegate_to: localhost
+      become: false
+    - ansible.builtin.include_tasks: tasks/controller.yml
+
+- name: Read the existing control and exit mesh addresses
+  hosts: control:exits
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/container-ownership.yml
+      vars:
+        owned_container_name: '{{ container_name }}'
+    - name: Read the deployed mesh address without restarting the service
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', exec, '{{ container_name }}', tailscale, ip, -4]
+      environment: '{{ container_cli_environment }}'
+      changed_when: false
+      register: migration_address
+    - ansible.builtin.set_fact:
+        mesh_ip: '{{ migration_address.stdout | trim }}'
+
+- name: Plan the conversion against the unchanged panel
+  hosts: control
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_tasks: tasks/single-client-panel-preflight.yml
+      vars:
+        migration_preflight: true
+    - name: Require a live directory ID for every reader before upgrading it
+      ansible.builtin.assert:
+        that: panel_directory.inbound_ids.get(item) is integer and panel_directory.inbound_ids[item] > 0
+        fail_msg: Deploy topology changes separately. Each migration ingress must already have a panel directory.
+      loop: '{{ groups.ingress }}'
+
+- name: Prepare and verify both new images before changing a running container
+  hosts: ingress:control
+  serial: 1
+  gather_facts: true
+  any_errors_fatal: true
+  roles: [prepare]
+  tasks:
+    - name: Require the capability label in the prepared image
+      ansible.builtin.command:
+        argv:
+          - '{{ container_engine }}'
+          - image
+          - inspect
+          - --format
+          - '{{ "{{ index .Config.Labels \"" + capability + "\" }}" }}'
+          - '{{ control_image if inventory_hostname in groups.control else node_image }}'
+      vars:
+        capability: "{{ 'io.vless.single-client-subscriptions' if inventory_hostname in groups.control else 'io.vless.single-client-routing' }}"
+      environment: '{{ container_cli_environment }}'
+      register: migration_capability
+      changed_when: false
+      failed_when: migration_capability.rc != 0 or migration_capability.stdout | trim != '1'
+
+- name: Roll one ingress at a time while the old panel still publishes its profiles
+  hosts: ingress
+  serial: 1
+  gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Capture the ingress clock before its upgrade
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', exec, '{{ container_name }}', date, '+%s']
+      environment: '{{ container_cli_environment }}'
+      register: migration_started
+      changed_when: false
+  roles: [ingress]
+  tasks:
+    - name: Verify the running container supports native routing
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', container, inspect, --format, '{{ ''{{ index .Config.Labels "io.vless.single-client-routing" }}'' }}', '{{ container_name }}']
+      environment: '{{ container_cli_environment }}'
+      register: running_reader
+      failed_when: running_reader.rc != 0 or running_reader.stdout | trim != '1'
+      changed_when: false
+    - name: Require the native selectors in the mounted configuration
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', exec, '{{ container_name }}', grep, -qx, 'single_client:', /etc/node/config.yaml]
+      environment: '{{ container_cli_environment }}'
+      changed_when: false
+    - name: Wait for a successful live panel sync after the upgrade
+      ansible.builtin.command:
+        argv: ['{{ container_engine }}', exec, '{{ container_name }}', stat, -c, '%Y', /var/lib/node/users.json]
+      environment: '{{ container_cli_environment }}'
+      register: migration_cache
+      changed_when: false
+      until: migration_cache.rc == 0 and (migration_cache.stdout | trim | int) > (migration_started.stdout | trim | int)
+      retries: '{{ ((sync_seconds | int + 15) / 2) | round(0, "ceil") | int }}'
+      delay: 2
+    - ansible.builtin.set_fact:
+        migration_reader_ready: true
+
+- name: Publish native subscriptions after every reader is ready
+  hosts: control
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify every inventory ingress completed this run
+      ansible.builtin.assert:
+        that: hostvars[item].migration_reader_ready | default(false) | bool
+      loop: '{{ groups.ingress }}'
+    - name: Reconcile control and preserve the installed ingress readers
+      ansible.builtin.include_role:
+        name: control
+      when: single_client_migration_phase | default('stage') == 'cutover'
+    - name: Report the staged deployment
+      ansible.builtin.debug:
+        msg: Readers have synced. Validate cached profiles, then run the same migration with single_client_migration_phase=cutover.
+      when: single_client_migration_phase | default('stage') == 'stage'

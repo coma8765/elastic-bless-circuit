@@ -38,8 +38,25 @@ options:
   password:
     type: str
     required: true
+  client_mode:
+    type: str
+    choices: [grouped, single]
+    default: grouped
+    description: In single mode the panel owns client lifecycle and inbound membership.
+  migrate_single_clients:
+    type: bool
+    default: false
+    description: Explicitly retire verified grouped client rows and their owned subscription links during a single-mode migration.
+  route_selectors:
+    type: dict
+    default: {}
+    description: Stable exit inventory name to VLESS route number in the range 16384..20479.
+  exit_countries:
+    type: dict
+    default: {}
+    description: Display country for each route selector.
   users:
-    description: Owned client identities; omitted previously owned identities are disabled.
+    description: Owned client identities for grouped mode or the identity manifest for an explicit migration.
     type: list
     elements: dict
     required: true
@@ -59,6 +76,8 @@ options:
     description: Optional HTTPS origin for advertised subscription links; omission preserves the current override.
     type: str
 notes:
+  - Single mode configures native directory publication. Create clients and choose their inbound memberships in the panel. Deleting a client there is permanent across topology runs.
+  - The single-mode conversion requires the original expanded client manifest and a quiescent database copy. It preserves the base record, its current memberships and its subscription token.
   - subscription_owner groups child identities through native external links; child backend subscription IDs are derived from the unchanged owner token.
   - Static external-link namePrefix values beginning vless-mesh-ansible: are reserved; unrelated rows are preserved.
   - Each ingress endpoint may include aliases containing address, port, remark and optional display_country; aliases inherit its security profile and use the same directory.
@@ -74,6 +93,7 @@ notes:
 MANAGED = "vless-mesh-ansible/v1"
 DIRECTORY = "vless-mesh-ansible-directory-v1"
 LINK_PREFIX = "vless-mesh-ansible:"
+ATTACH_FROM = "vlessMeshAttachFrom"
 
 
 class PanelError(Exception):
@@ -192,11 +212,14 @@ def country_labels(params):
             host = advertised['address']
             host = str(ipaddress.ip_address(host)) if is_ip_literal(host) else host.lower()
             ingress[(host, valid_port(advertised['port']))] = label
-    for user in params['users']:
-        label = country(user.get('exit_display_country', ''))
-        if user['exit'] in exits and exits[user['exit']] != label:
-            raise PanelError('one exit must have one consistent display country')
-        exits[user['exit']] = label
+    if params.get('client_mode') == 'single':
+        exits = {name: country(label) for name, label in params.get('exit_countries', {}).items()}
+    else:
+        for user in params['users']:
+            label = country(user.get('exit_display_country', ''))
+            if user['exit'] in exits and exits[user['exit']] != label:
+                raise PanelError('one exit must have one consistent display country')
+            exits[user['exit']] = label
     enabled = any(ingress.values()) or any(exits.values())
     if enabled:
         if not all(ingress.values()) or not all(exits.values()):
@@ -276,6 +299,27 @@ def validate(params):
     if not securities.issubset({"tls", "reality"}) or len(securities) != 1:
         raise PanelError("all managed endpoints must use one security profile: TLS or REALITY; mixed deployments require separate panels")
     reality_mode = securities == {"reality"}
+    if params.get('client_mode', 'grouped') not in ('grouped', 'single'):
+        raise PanelError('unknown client_mode')
+    if type(params.get('migrate_single_clients', False)) is not bool:
+        raise PanelError('migrate_single_clients must be a boolean')
+    single = params.get('client_mode', 'grouped') == 'single'
+    if params.get('migrate_single_clients') and not single:
+        raise PanelError('migrate_single_clients requires single client mode')
+    if single:
+        selectors = params.get('route_selectors', {})
+        countries = params.get('exit_countries', {})
+        if not reality_mode:
+            raise PanelError('single client mode requires managed REALITY directories')
+        if not isinstance(selectors, dict) or not selectors or not isinstance(countries, dict) or set(selectors) != set(countries):
+            raise PanelError('single client mode requires a selector and display country for each exit')
+        if any(not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', name)
+               or type(value) is not int or not 16384 <= value <= 20479 for name, value in selectors.items()):
+            raise PanelError('single client selectors must map stable exit names to integers in 16384..20479')
+        if len(set(selectors.values())) != len(selectors):
+            raise PanelError('single client route selectors must be unique')
+        if not all(countries.values()):
+            raise PanelError('single client mode requires nonempty exit display countries')
     for user in params["users"]:
         flow = user.get("flow") or ("xtls-rprx-vision" if reality_mode else "")
         if not reality_mode and flow:
@@ -338,7 +382,7 @@ def validate(params):
                             "remark": endpoint["remark"], "forceTls": "tls",
                             "sni": endpoint.get("tls_server_name") or address})
     labeled, _, _ = country_labels(params)
-    known_exits = {user['exit'] for user in params['users']}
+    known_exits = set(params['route_selectors']) if single else {user['exit'] for user in params['users']}
     for endpoint in params['ingress_endpoints']:
         allowed = endpoint.get('subscription_exits', [])
         if (not isinstance(allowed, list) or any(not isinstance(name, str) or
@@ -349,6 +393,10 @@ def validate(params):
             raise PanelError('subscription_exits filters require complete country labels to suppress native subscription routes')
         if known_exits and set(allowed) - known_exits:
             raise PanelError('subscription_exits references an unknown configured user exit')
+    if single:
+        if not labeled:
+            raise PanelError('single client mode requires country labels')
+        return proxies
     for owner in params['users']:
         if (owner.get('subscription_owner') or owner['email']) != owner['email']:
             continue
@@ -458,6 +506,206 @@ def external_link_payload(row):
              ('expiryTime', 0), ('namePrefix', '')]}
 
 
+def single_proxies(params, endpoint, primary):
+    """3x-ui v3.11 encodes vlessRoute in bytes 6–7 of the link's UUID."""
+    advertised = [endpoint] + (endpoint.get('aliases') or [])
+    result = []
+    exits = endpoint.get('subscription_exits') or list(params['route_selectors'])
+    for address, proxy in zip(advertised, endpoint_proxies(endpoint, primary)):
+        country = address.get('display_country') or endpoint['display_country']
+        for exit_name in exits:
+            result.append(dict(proxy, vlessRoute=str(params['route_selectors'][exit_name]),
+                               remarkFinal=True, remark=country + ' -> ' + params['exit_countries'][exit_name]))
+    return result
+
+
+def is_routed_directory(inbound):
+    proxies = object_value(inbound.get('streamSettings') or {}).get('externalProxy') or []
+    return any(isinstance(proxy, dict) and 'vlessRoute' in proxy for proxy in proxies)
+
+
+def migration_plan(params, panel, clients, directories):
+    """Read and verify the entire conversion before changing any client or link."""
+    manifest = {u['email']: u for u in params['users']}
+    records = {r['email']: r for r in clients}
+    directory_ids = {r['id'] for r in directories}
+    endpoint_exits = {DIRECTORY + ':' + e['remark']: set(e.get('subscription_exits') or params['route_selectors'])
+                      for e in params['ingress_endpoints']}
+    prior_ids = {d['id'] for d in directories if d['remark'] in endpoint_exits and d.get('enable')}
+    new_names = set(endpoint_exits) - {d['remark'] for d in directories}
+    family_exits = {}
+    for user in manifest.values():
+        family_exits.setdefault(user.get('subscription_owner') or user['email'], set()).add(user['exit'])
+    expected_children = {u['email']: u for u in manifest.values()
+                         if (u.get('subscription_owner') or u['email']) != u['email']}
+    for name, child in expected_children.items():
+        if name != child['subscription_owner'] + '--' + child['exit']:
+            raise PanelError('migration manifest contains a noncanonical child name')
+    details = {name: panel.call('/panel/api/clients/get/' + urllib.parse.quote(name, safe=''))
+               for name in records}
+    addresses = {(str(ipaddress.ip_address(a['address'])) if is_ip_literal(a['address']) else a['address'].lower(), a['port'])
+                 for endpoint in params['ingress_endpoints'] for a in [endpoint] + (endpoint.get('aliases') or [])}
+    children = []
+    cleanup = []
+    for rec in clients:
+        name = rec['email']
+        wanted = manifest.get(name)
+        marker = object_value(rec['comment']) if ownership(rec) else {}
+        # A generated name alone is not proof of ownership. A marked child
+        # absent from the trusted manifest may be a retired/audit identity.
+        old_exit = marker.get('exit')
+        if wanted is None and isinstance(old_exit, str) and name.endswith('--' + old_exit):
+            raise PanelError('unexpected managed exit child is absent from migration manifest')
+        child = expected_children.get(name)
+        if child is not None:
+            owner_name = child['subscription_owner']
+            owner = records.get(owner_name)
+            if (not owner or not ownership(owner) or owner.get('uuid') != manifest[owner_name]['uuid']
+                    or owner.get('subId') != manifest[owner_name]['sub_id'] or not marker
+                    or old_exit != child['exit'] or rec.get('uuid') != child['uuid']
+                    or rec.get('subId') != child['sub_id']):
+                raise PanelError('legacy child or owner credentials/ownership differ from migration manifest')
+            attached = set(rec.get('inboundIds') or [])
+            owner_ids = set(owner.get('inboundIds') or [])
+            owner_links = details[owner_name].get('externalLinks') or []
+            has_old_links = any(row.get('kind') == 'link' and (row.get('namePrefix') or '').startswith(LINK_PREFIX)
+                                for row in owner_links)
+            # DeleteByEmail can partially detach before reporting failure. Once
+            # old owned links have been cleared, retry the remaining memberships.
+            if attached - directory_ids or attached - owner_ids or (has_old_links and attached != owner_ids):
+                raise PanelError('legacy child has differing or unrelated inbound memberships')
+            if any(rec.get(k) != owner.get(k) for k in ('enable', 'expiryTime', 'totalGB', 'limitIp', 'limitHwid')):
+                raise PanelError('legacy child policy differs from its owner')
+        path = urllib.parse.quote(name, safe='')
+        rows = details[name].get('externalLinks') or []
+        if not isinstance(rows, list):
+            raise PanelError('invalid external link list from panel')
+        if child is not None:
+            if rows:
+                raise PanelError('legacy child owns external links; preserve them before conversion')
+            children.append(path)
+            continue
+        kept = []
+        for row in rows:
+            prefix = row.get('namePrefix') or ''
+            if row.get('kind') != 'link' or not prefix.startswith(LINK_PREFIX):
+                kept.append(external_link_payload(row))
+                continue
+            linked = manifest.get(prefix[len(LINK_PREFIX):])
+            uri = urllib.parse.urlsplit(row['value'])
+            hostname = uri.hostname or ''
+            address = str(ipaddress.ip_address(hostname)) if is_ip_literal(hostname) else hostname.lower()
+            if (not wanted or marker.get('exit') != wanted['exit'] or rec.get('uuid') != wanted['uuid']
+                    or rec.get('subId') != wanted['sub_id'] or not linked
+                    or (linked.get('subscription_owner') or linked['email']) != name
+                    or uri.scheme != 'vless' or uri.username != linked['uuid']
+                    or (address, uri.port) not in addresses):
+                raise PanelError('unexpected owned subscription link or owner credentials during migration')
+        if wanted and marker:
+            if (old_exit != wanted['exit'] or rec.get('uuid') != wanted['uuid']
+                    or rec.get('subId') != wanted['sub_id']):
+                raise PanelError('legacy owner credentials/ownership differ from migration manifest')
+            memberships = set(rec.get('inboundIds') or [])
+            eligible = {d['remark'] for d in directories if d['id'] in memberships}
+            if prior_ids and prior_ids <= memberships:
+                eligible.update(new_names)
+            if any(endpoint_exits.get(remark, set()) - family_exits[name] for remark in eligible):
+                raise PanelError('migration would grant exits outside the original subscription assignment')
+        if len(kept) != len(rows):
+            cleanup.append((path, kept))
+    return cleanup, children
+
+
+def prepare_single_clients(params, panel, clients, directories):
+    # Xray masks bytes 6 and 7 during VLESS authentication. A full-UUID
+    # uniqueness check alone permits two users to authenticate as each other.
+    keys = {}
+    managed_ids = {d['id'] for d in directories}
+    for client in clients:
+        if not managed_ids.intersection(client.get('inboundIds') or []):
+            continue
+        try:
+            raw = uuid.UUID(client['uuid']).bytes
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise PanelError('a client attached to a managed directory has no valid VLESS UUID')
+        identity = raw[:6] + raw[8:]
+        if identity in keys:
+            raise PanelError('clients attached to managed directories have colliding masked VLESS UUIDs')
+        keys[identity] = client['email']
+    if not params.get('migrate_single_clients'):
+        planned = {DIRECTORY + ':' + endpoint['remark'] for endpoint in params['ingress_endpoints']}
+        legacy_ids = {d['id'] for d in directories if not is_routed_directory(d)
+                      and (d['remark'] in planned or d.get('enable'))}
+        if any(legacy_ids.intersection(r.get('inboundIds') or []) for r in clients):
+            raise PanelError('populated grouped directories require explicit single-client migration')
+        records = {r['email']: r for r in clients}
+        for record in clients:
+            if not ownership(record):
+                continue
+            old_exit = object_value(record['comment']).get('exit')
+            name = record['email']
+            if not isinstance(old_exit, str) or not name.endswith('--' + old_exit):
+                continue
+            owner = records.get(name[:-(len(old_exit) + 2)])
+            if (owner and owner.get('subId')
+                    and record.get('subId') == child_subscription_id(owner['subId'], name)):
+                raise PanelError('remaining grouped child requires explicit single-client migration')
+        return [], []
+    return migration_plan(params, panel, clients, directories)
+
+
+def inherit_directory_memberships(panel, inbound_id, sources, child_paths):
+    # This marker exists only between creating a new directory and committing
+    # its initial membership. Later topology runs respect all UI detaches.
+    pending = []
+    for record in panel.call('/panel/api/clients/list'):
+        attached = set(record.get('inboundIds') or [])
+        if (sources <= attached and inbound_id not in attached
+                and urllib.parse.quote(record['email'], safe='') not in child_paths):
+            pending.append(record['email'])
+    if pending:
+        result = panel.call('/panel/api/clients/bulkAttach', {'emails': pending, 'inboundIds': [inbound_id]})
+        if not isinstance(result, dict) or result.get('errors'):
+            raise PanelError('panel could not attach eligible clients to the new directory')
+        acknowledged = set(result.get('attached') or []) | set(result.get('skipped') or [])
+        if acknowledged != set(pending):
+            raise PanelError('panel did not account for all initial directory memberships')
+    fresh = next((d for d in panel.call('/panel/api/inbounds/list') if d['id'] == inbound_id), None)
+    if not fresh or not owned_directory(fresh):
+        raise PanelError('new directory disappeared or changed ownership during initial attachment')
+    stream = object_value(fresh['streamSettings'])
+    if set(stream.pop(ATTACH_FROM, [])) != sources:
+        raise PanelError('new directory attachment state changed during reconciliation')
+    panel.call('/panel/api/inbounds/update/' + str(inbound_id), dict(fresh, streamSettings=stream))
+
+
+def check_native_publication(panel, params, directories):
+    # Native Host projection can supersede streamSettings.externalProxy. Check
+    # what the pinned panel actually renders before retiring the legacy links.
+    owners = {u['email'] for u in params['users'] if (u.get('subscription_owner') or u['email']) == u['email']}
+    for client in panel.call('/panel/api/clients/list'):
+        if client['email'] not in owners:
+            continue
+        base = uuid.UUID(client['uuid']).bytes
+        expected = set()
+        for iid in client.get('inboundIds') or []:
+            for proxy in directories.get(iid, []):
+                route = int(proxy['vlessRoute']).to_bytes(2, 'big')
+                credential = str(uuid.UUID(bytes=base[:6] + route + base[8:]))
+                expected.add((proxy['dest'].lower(), proxy['port'], credential, proxy['remark']))
+        if not expected:
+            continue
+        path = urllib.parse.quote(client['email'], safe='')
+        addresses = {key[:2] for key in expected}
+        seen = []
+        for raw in panel.call('/panel/api/clients/links/' + path) or []:
+            link = urllib.parse.urlsplit(raw)
+            if link.scheme == 'vless' and link.hostname and (link.hostname.lower(), link.port) in addresses:
+                seen.append((link.hostname.lower(), link.port, link.username, urllib.parse.unquote(link.fragment)))
+        if set(seen) != expected or len(seen) != len(expected):
+            raise PanelError('panel did not render the expected native VLESS route or country label; legacy clients retained')
+
+
 def reconcile_subscription_links(module, panel, active_ids):
     """Compose native child share links without fetching remote subscriptions."""
     changed = False
@@ -544,114 +792,10 @@ def reconcile_subscription_links(module, panel, active_ids):
     return changed
 
 
-def reconcile(module, panel, proxies):
-    params = module.params
-    inbounds = panel.call("/panel/api/inbounds/list")
-    clients = panel.call("/panel/api/clients/list")
-    if not isinstance(inbounds, list) or not isinstance(clients, list):
-        raise PanelError("panel returned an invalid list response")
-    managed_inbounds = [entry for entry in inbounds if owned_directory(entry)]
-    remarks = [entry.get("remark") for entry in managed_inbounds]
-    if len(remarks) != len(set(remarks)):
-        raise PanelError("multiple managed directory inbounds exist; resolve ownership manually")
-    by_remark = {entry["remark"]: entry for entry in managed_inbounds}
-    by_email = {entry["email"]: entry for entry in clients}
-    desired_by_email = {entry["email"]: entry for entry in params["users"]}
-    for email in desired_by_email:
-        if email in by_email and not ownership(by_email[email]):
-            raise PanelError("desired email already belongs to an unmanaged client")
-    desired_ids = {entry["uuid"]: entry["email"] for entry in params["users"]}
-    for record in clients:
-        existing_id = str(record.get("uuid", "")).lower()
-        if existing_id in desired_ids and desired_ids[existing_id] != record.get("email"):
-            raise PanelError("desired UUID is already assigned to a different panel client")
-    for inbound in managed_inbounds:
-        if inbound.get("protocol") != "vless":
-            raise PanelError("reserved directory inbound is not VLESS")
-        if any(inbound["id"] in entry.get("inboundIds", []) and not ownership(entry) for entry in clients):
-            raise PanelError("unmanaged clients are attached to a managed directory; preserve them in a separate inbound")
-    reality_mode = params["ingress_endpoints"][0]["security"] == "reality"
-    specs = []
-    hide_after_links = set()
-    used_ports = {entry["port"] for entry in inbounds}
-    for index, endpoint in enumerate(params["ingress_endpoints"] if reality_mode else [None]):
-        remark = DIRECTORY + ":" + endpoint["remark"] if reality_mode else DIRECTORY
-        existing = by_remark.get(remark)
-        listen_port = existing["port"] if existing else params["directory_port"]
-        if not existing:
-            while listen_port in used_ports:
-                listen_port += 1
-                valid_port(listen_port)
-        used_ports.add(listen_port)
-        stream = directory_stream(endpoint, proxies[index], existing) if reality_mode else {
-            "network": "tcp", "security": "none", "externalProxy": [
-                advertised for physical, primary in zip(params["ingress_endpoints"], proxies) if physical.get("advertise", True)
-                for advertised in endpoint_proxies(physical, primary)]}
-        desired = {"remark": remark, "listen": "127.0.0.1", "port": listen_port,
-                   "protocol": "vless", "streamSettings": stream, "disableFlow": False,
-                   "sniffing": {"enabled": False}, "expiryTime": 0, "total": 0,
-                   "excludeFromSub": country_labels(params)[0] or (endpoint is not None and not endpoint.get("advertise", True))}
-        # Keep existing native entries available until their replacements exist.
-        # New unpublished directories are hidden immediately.
-        if (country_labels(params)[0] and existing is not None
-                and not existing.get("excludeFromSub", False)
-                and (endpoint is None or endpoint.get("advertise", True))):
-            desired["excludeFromSub"] = False
-            hide_after_links.add(existing["id"])
-        names = [endpoint["remark"]] if reality_mode else [e.get("remark") or (e["address"] + ":" + str(e["port"])) for e in params["ingress_endpoints"]]
-        specs.append((desired, existing, names))
-    changed, inbound_ids, active_ids = False, {}, []
-    desired_remarks = {desired["remark"] for desired, _, _ in specs}
-    # Retire only our own directory profiles. Detaching our owned identities
-    # avoids stale TLS/plaintext flow gates during a deliberate profile migration.
-    for old in managed_inbounds:
-        if old["remark"] in desired_remarks:
-            continue
-        for record in clients:
-            if old["id"] in record.get("inboundIds", []):
-                changed = True
-                if not module.check_mode:
-                    panel.call("/panel/api/clients/" + urllib.parse.quote(record["email"], safe="") + "/detach", {"inboundIds": [old["id"]]})
-        if old.get("enable") or not old.get("excludeFromSub"):
-            changed = True
-            if not module.check_mode:
-                payload = copy.deepcopy(old)
-                payload["excludeFromSub"] = True
-                panel.call("/panel/api/inbounds/update/" + str(old["id"]), payload)
-                panel.call("/panel/api/inbounds/setEnable/" + str(old["id"]), {"enable": False})
-    for desired, existing, names in specs:
-        iid = existing["id"] if existing else None
-        if existing is None:
-            changed = True
-            if not module.check_mode:
-                created = panel.call("/panel/api/inbounds/add", dict(desired, enable=True,
-                                     settings={"clients": [], "decryption": "none"}))
-                if not isinstance(created, dict) or not isinstance(created.get("id"), int):
-                    raise PanelError("panel did not return a created inbound ID")
-                iid = created["id"]
-        else:
-            normalized = dict(existing)
-            normalized["streamSettings"] = object_value(existing.get("streamSettings", {}))
-            normalized["sniffing"] = object_value(existing.get("sniffing", {}))
-            needs_update = any(normalized.get(k) != v for k, v in desired.items()
-                               if k not in ("streamSettings", "sniffing"))
-            needs_update |= differs(normalized["streamSettings"], desired["streamSettings"])
-            needs_update |= normalized["sniffing"].get("enabled") is not False
-            settings = object_value(existing.get("settings", {}))
-            needs_update |= settings.get("decryption") != "none"
-            if needs_update:
-                changed = True
-                if not module.check_mode:
-                    payload = copy.deepcopy(existing)
-                    payload.update(desired)
-                    payload["settings"] = dict(settings, decryption="none")
-                    panel.call("/panel/api/inbounds/update/" + str(iid), payload)
-            if not existing.get("enable", False):
-                changed = True
-                if not module.check_mode:
-                    panel.call("/panel/api/inbounds/setEnable/" + str(iid), {"enable": True})
-        active_ids.append(iid)
-        inbound_ids.update({name: iid for name in names})
+def reconcile_grouped_clients(module, panel, clients, active_ids, reality_mode):
+    changed = False
+    by_email = {r['email']: r for r in clients}
+    desired_by_email = {u['email']: u for u in module.params['users']}
     for email, desired in desired_by_email.items():
         record = by_email.get(email)
         metadata = desired.get('metadata') or {}
@@ -691,6 +835,161 @@ def reconcile(module, panel, proxies):
                 payload["enable"] = False
                 panel.call("/panel/api/clients/update/" + urllib.parse.quote(record["email"], safe=""), payload)
     changed |= reconcile_subscription_links(module, panel, active_ids)
+    return changed
+
+
+def validate_grouped_ownership(params, clients, managed_inbounds):
+    by_email = {entry["email"]: entry for entry in clients}
+    desired_by_email = {entry["email"]: entry for entry in params["users"]}
+    for email in desired_by_email:
+        if email in by_email and not ownership(by_email[email]):
+            raise PanelError("desired email already belongs to an unmanaged client")
+    desired_ids = {entry["uuid"]: entry["email"] for entry in params["users"]}
+    for record in clients:
+        existing_id = str(record.get("uuid", "")).lower()
+        if existing_id in desired_ids and desired_ids[existing_id] != record.get("email"):
+            raise PanelError("desired UUID is already assigned to a different panel client")
+    for inbound in managed_inbounds:
+        if any(inbound["id"] in entry.get("inboundIds", []) and not ownership(entry) for entry in clients):
+            raise PanelError("unmanaged clients are attached to a managed directory; preserve them in a separate inbound")
+
+
+def reconcile(module, panel, proxies):
+    params = module.params
+    inbounds = panel.call("/panel/api/inbounds/list")
+    clients = panel.call("/panel/api/clients/list")
+    if not isinstance(inbounds, list) or not isinstance(clients, list):
+        raise PanelError("panel returned an invalid list response")
+    managed_inbounds = [entry for entry in inbounds if owned_directory(entry)]
+    remarks = [entry.get("remark") for entry in managed_inbounds]
+    if len(remarks) != len(set(remarks)):
+        raise PanelError("multiple managed directory inbounds exist; resolve ownership manually")
+    by_remark = {entry["remark"]: entry for entry in managed_inbounds}
+    single = params.get('client_mode') == 'single'
+    if any(inbound.get('protocol') != 'vless' for inbound in managed_inbounds):
+        raise PanelError('reserved directory inbound is not VLESS')
+    changed = False
+    cleanup, children = [], []
+    if single:
+        cleanup, children = prepare_single_clients(params, panel, clients, managed_inbounds)
+    else:
+        if any(is_routed_directory(d) for d in managed_inbounds):
+            raise PanelError('native single-client directories cannot be reconciled as grouped')
+        validate_grouped_ownership(params, clients, managed_inbounds)
+    reality_mode = params["ingress_endpoints"][0]["security"] == "reality"
+    specs = []
+    hide_after_links = set()
+    used_ports = {entry["port"] for entry in inbounds}
+    for index, endpoint in enumerate(params["ingress_endpoints"] if reality_mode else [None]):
+        remark = DIRECTORY + ":" + endpoint["remark"] if reality_mode else DIRECTORY
+        existing = by_remark.get(remark)
+        listen_port = existing["port"] if existing else params["directory_port"]
+        if not existing:
+            while listen_port in used_ports:
+                listen_port += 1
+                valid_port(listen_port)
+        used_ports.add(listen_port)
+        stream = directory_stream(endpoint, proxies[index], existing) if reality_mode else {
+            "network": "tcp", "security": "none", "externalProxy": [
+                advertised for physical, primary in zip(params["ingress_endpoints"], proxies) if physical.get("advertise", True)
+                for advertised in endpoint_proxies(physical, primary)]}
+        if single:
+            stream['externalProxy'] = single_proxies(params, endpoint, proxies[index])
+        desired = {"remark": remark, "listen": "127.0.0.1", "port": listen_port,
+                   "protocol": "vless", "streamSettings": stream, "disableFlow": False,
+                   "sniffing": {"enabled": False}, "expiryTime": 0, "total": 0,
+                   "excludeFromSub": (not single and country_labels(params)[0]) or (endpoint is not None and not endpoint.get("advertise", True))}
+        # Keep existing native entries available until their replacements exist.
+        # New unpublished directories are hidden immediately.
+        if (not single and country_labels(params)[0] and existing is not None
+                and not existing.get("excludeFromSub", False)
+                and (endpoint is None or endpoint.get("advertise", True))):
+            desired["excludeFromSub"] = False
+            hide_after_links.add(existing["id"])
+        names = [endpoint["remark"]] if reality_mode else [e.get("remark") or (e["address"] + ":" + str(e["port"])) for e in params["ingress_endpoints"]]
+        specs.append((desired, existing, names))
+    inbound_ids, active_ids = {}, []
+    desired_remarks = {desired["remark"] for desired, _, _ in specs}
+    prior_ids = {d['id'] for d in managed_inbounds if single and d['remark'] in desired_remarks
+                 and d.get('enable') and ATTACH_FROM not in object_value(d['streamSettings'])}
+    child_paths = set(children)
+    native_dirs = {}
+    # Retire only our own directory profiles. Detaching our owned identities
+    # avoids stale TLS/plaintext flow gates during a deliberate profile migration.
+    for old in managed_inbounds:
+        if old["remark"] in desired_remarks:
+            continue
+        for record in clients:
+            if not single and old["id"] in record.get("inboundIds", []):
+                changed = True
+                if not module.check_mode:
+                    panel.call("/panel/api/clients/" + urllib.parse.quote(record["email"], safe="") + "/detach", {"inboundIds": [old["id"]]})
+        if old.get("enable") or not old.get("excludeFromSub"):
+            changed = True
+            if not module.check_mode:
+                payload = copy.deepcopy(old)
+                payload["excludeFromSub"] = True
+                panel.call("/panel/api/inbounds/update/" + str(old["id"]), payload)
+                panel.call("/panel/api/inbounds/setEnable/" + str(old["id"]), {"enable": False})
+    for desired, existing, names in specs:
+        iid = existing["id"] if existing else None
+        pending_sources = set()
+        if single:
+            if existing is None:
+                pending_sources = prior_ids
+            else:
+                pending_sources = set(object_value(existing['streamSettings']).get(ATTACH_FROM, []))
+                if pending_sources - prior_ids:
+                    raise PanelError('initial attachment references a missing or retired source directory')
+            if pending_sources:
+                desired['streamSettings'][ATTACH_FROM] = sorted(pending_sources)
+        if existing is None:
+            changed = True
+            if not module.check_mode:
+                created = panel.call("/panel/api/inbounds/add", dict(desired, enable=True,
+                                     settings={"clients": [], "decryption": "none"}))
+                if not isinstance(created, dict) or not isinstance(created.get("id"), int):
+                    raise PanelError("panel did not return a created inbound ID")
+                iid = created["id"]
+        else:
+            normalized = dict(existing)
+            normalized["streamSettings"] = object_value(existing.get("streamSettings", {}))
+            normalized["sniffing"] = object_value(existing.get("sniffing", {}))
+            needs_update = any(normalized.get(k) != v for k, v in desired.items()
+                               if k not in ("streamSettings", "sniffing"))
+            needs_update |= differs(normalized["streamSettings"], desired["streamSettings"])
+            needs_update |= normalized["sniffing"].get("enabled") is not False
+            settings = object_value(existing.get("settings", {}))
+            needs_update |= settings.get("decryption") != "none"
+            if needs_update:
+                changed = True
+                if not module.check_mode:
+                    payload = copy.deepcopy(existing)
+                    payload.update(desired)
+                    payload["settings"] = dict(settings, decryption="none")
+                    panel.call("/panel/api/inbounds/update/" + str(iid), payload)
+            if not existing.get("enable", False):
+                changed = True
+                if not module.check_mode:
+                    panel.call("/panel/api/inbounds/setEnable/" + str(iid), {"enable": True})
+        active_ids.append(iid)
+        inbound_ids.update({name: iid for name in names})
+        if pending_sources:
+            changed = True
+            if not module.check_mode:
+                inherit_directory_memberships(panel, iid, pending_sources, child_paths)
+        if single and not desired['excludeFromSub']:
+            native_dirs[iid] = desired['streamSettings']['externalProxy']
+    if cleanup or children:
+        changed = True
+        if not module.check_mode:
+            check_native_publication(panel, params, native_dirs)
+            for path, kept in cleanup:
+                panel.call('/panel/api/clients/' + path + '/externalLinks', {'externalLinks': kept})
+            for path in children:
+                panel.call('/panel/api/clients/del/' + path + '?keepTraffic=1', {})
+    if not single:
+        changed |= reconcile_grouped_clients(module, panel, clients, active_ids, reality_mode)
     if hide_after_links:
         changed = True
         if not module.check_mode:
@@ -731,6 +1030,10 @@ def reconcile(module, panel, proxies):
 
 def main():
     module = AnsibleModule(argument_spec={
+        "client_mode": {"type": "str", "choices": ["grouped", "single"], "default": "grouped"},
+        "route_selectors": {"type": "dict", "default": {}},
+        "exit_countries": {"type": "dict", "default": {}},
+        "migrate_single_clients": {"type": "bool", "default": False},
         "url": {"type": "str", "required": True},
         "username": {"type": "str", "required": True, "no_log": True},
         "password": {"type": "str", "required": True, "no_log": True},

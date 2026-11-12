@@ -57,8 +57,14 @@ exits:
     port: {{ hostvars[peer].transit_port }}
     uuid_file: /run/secrets/{{ peer }}-uuid
 {% endfor %}
+{% if panel_client_mode | default('grouped') == 'single' %}
+single_client:
+  selectors: {{ vless_route_selectors | dict2items | selectattr('key', 'in', ingress_subscription_exits | default([]) or groups.exits) | list | items2dict | to_json }}
+  legacy: {{ hostvars[groups.headscale[0]].single_client_legacy.owners | to_json }}
+{% else %}
 routes:
 {% for user in hostvars[groups.headscale[0]].managed_users %}
   {{ user.email | to_json }}: {{ user.exit | to_json }}
 {% endfor %}
+{% endif %}
 {% endif %}

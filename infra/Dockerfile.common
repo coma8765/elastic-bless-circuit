@@ -17,6 +17,7 @@ COPY --from=build /src/build/node-agent /usr/local/bin/
 COPY --from=downloads /opt/bin/ /usr/local/bin/
 COPY --from=downloads /opt/share/ /usr/local/share/xray/
 COPY infra/entrypoint.sh /usr/local/bin/entrypoint
+LABEL io.vless.single-client-routing="1"
 ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
 VOLUME ["/var/lib/tailscale", "/var/lib/node"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=90s --retries=3 CMD test -f /run/node/ready && test $(($(date +%s) - $(stat -c %Y /run/node/ready))) -lt 10

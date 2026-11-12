@@ -1,0 +1,17 @@
+---
+- name: Verify client policy, memberships and subscription ownership against the live panel
+  vless_panel:
+    url: 'http://127.0.0.1:{{ panel_host_port }}'
+    username: '{{ panel_username }}'
+    password: '{{ hostvars[groups.headscale[0]].panel_password }}'
+    users: '{{ hostvars[groups.headscale[0]].managed_users }}'
+    client_mode: single
+    migrate_single_clients: '{{ migration_preflight }}'
+    route_selectors: '{{ vless_route_selectors }}'
+    exit_countries: "{{ dict(groups.exits | zip(groups.exits | map('extract', hostvars, 'exit_display_country'))) }}"
+    ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
+    subscription_public_url: '{{ subscription_public_url }}'
+  check_mode: true
+  changed_when: false
+  no_log: true
+  register: panel_directory

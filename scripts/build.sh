@@ -35,6 +35,13 @@ if [ "$control_needed" = true ]; then
     docker build -t localhost/vless-control:dev -f infra/Dockerfile.control .
   fi
 fi
+if [ "$control_needed" = true ] && [ "${PANEL_CLIENT_MODE:-grouped}" = single ]; then
+  if [ "$engine" = podman ]; then
+    podman build --format docker -t localhost/vless-control:single -f infra/Dockerfile.control.single .
+  else
+    docker build -t localhost/vless-control:single -f infra/Dockerfile.control.single .
+  fi
+fi
 if [ "$headscale_needed" = true ]; then
   if [ "$engine" = podman ]; then
     podman build --format oci -t localhost/vless-headscale:dev -f infra/Dockerfile.headscale .

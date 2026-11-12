@@ -2,6 +2,20 @@
   ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/container-ownership.yml'
   vars:
     owned_container_name: '{{ deployment_id }}-gateway'
+- name: Verify the prepared control image supports native subscriptions
+  ansible.builtin.command:
+    argv:
+    - '{{ container_engine }}'
+    - image
+    - inspect
+    - --format
+    - '{{ ''{{ index .Config.Labels "io.vless.single-client-subscriptions" }}'' }}'
+    - '{{ control_image }}'
+  environment: '{{ container_cli_environment }}'
+  register: single_control_image
+  changed_when: false
+  failed_when: single_control_image.rc != 0 or single_control_image.stdout | trim != '1'
+  when: panel_client_mode == 'single'
 - name: Deploy control with its persistent database
   ansible.builtin.include_role:
     name: node
@@ -21,10 +35,21 @@
     username: '{{ panel_username }}'
     password: '{{ hostvars[groups.headscale[0]].panel_password }}'
     users: '{{ hostvars[groups.headscale[0]].managed_users }}'
+    client_mode: '{{ panel_client_mode }}'
+    migrate_single_clients: '{{ migrate_single_clients }}'
+    route_selectors: '{{ vless_route_selectors }}'
+    exit_countries: "{{ dict(groups.exits | zip(groups.exits | map('extract', hostvars, 'exit_display_country'))) if panel_client_mode == 'single' else {} }}"
     ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
     subscription_public_url: '{{ subscription_public_url }}'
   register: panel_directory
   no_log: true
+- name: Verify the single-client subscription eligibility check
+  ansible.builtin.uri:
+    url: 'http://127.0.0.1:{{ subscription_host_port }}/sub/mesh-preflight-{{ 999999999999 | random }}'
+    status_code: 404
+  register: single_feed_check
+  failed_when: single_feed_check.status != 404 or single_feed_check.x_mesh_client_mode | default('') != 'single'
+  when: panel_client_mode == 'single'
 - name: Install subscription TLS credentials
   ansible.builtin.copy:
     src: '{{ item.src }}'

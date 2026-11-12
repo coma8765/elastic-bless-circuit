@@ -20,7 +20,7 @@ docker_minimum_version: '20.10'
 podman_minimum_version: '4.9'
 prepare_images_by_role: true
 node_image: localhost/vless-node:dev
-control_image: localhost/vless-control:dev
+control_image: "{{ 'localhost/vless-control:single' if panel_client_mode == 'single' else 'localhost/vless-control:dev' }}"
 headscale_image: localhost/vless-headscale:dev
 gateway_image: localhost/vless-gateway:dev
 container_name: "{{ deployment_id }}-{{ inventory_hostname }}"
@@ -64,6 +64,10 @@ allow_private_destinations: false
 exit_dns_servers: []
 sync_seconds: 15
 max_stale_seconds: 86400
+# Single mode delegates accounts and memberships to the native 3x-ui Clients page.
+panel_client_mode: grouped
+vless_route_selectors: {}
+migrate_single_clients: false
 vless_users: []
 # Ansible owns these unlimited users; edit enabled here, not through competing UI automation.
 # - {email: alice-eu, exit: out-eu, enabled: true}

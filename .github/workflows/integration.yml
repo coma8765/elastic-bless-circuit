@@ -16,7 +16,7 @@ jobs:
   integration:
     name: Mesh, recovery and Ansible topology growth
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +38,7 @@ jobs:
           .local/ansible-venv/bin/python -m pip install -r deploy/ansible/requirements.txt
           .local/ansible-venv/bin/ansible-galaxy collection install -r deploy/ansible/requirements.yml -p .local/ansible-collections
       - name: Build all Debian service images
-        run: sudo env PATH="$PATH" ./scripts/build.sh
+        run: sudo env PATH="$PATH" PANEL_CLIENT_MODE=single ./scripts/build.sh
       - name: Prepare the official Python DNS canary image
         run: sudo podman pull docker.io/library/python:3.13-slim
       - name: Check container networking capabilities
@@ -74,6 +74,9 @@ jobs:
             exit 1
           fi
           echo 'REALITY identity persistence, Vision subscription metadata and distinct-key ingress growth checks passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Test native single-client subscriptions with the patched panel
+        run: |
+          sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/single_client_integration.py --engine podman --image localhost/vless-control:single
       - name: Test isolated exit DNS caching and private destination denial
         run: |
           if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/exit_dns_runtime.py > .local/ci-private/exit-dns-runtime.log 2>&1; then

@@ -46,7 +46,7 @@ Local verification results: [docs/verification.md](docs/verification.md).
 
 ## Deploy the full system with Ansible
 
-[deploy/ansible/README.md](deploy/ansible/README.md) covers installation and the Debian SSH inventory. The playbook provisions Headscale with ACLs, control and an HTTPS subscription gateway, exits, ingress, persistent credentials and user subscriptions. YAML inventory is the source of managed accounts and routes.
+[deploy/ansible/README.md](deploy/ansible/README.md) covers installation and the Debian SSH inventory. The playbook provisions Headscale with ACLs, control and an HTTPS subscription gateway, exits, ingress, persistent credentials and user subscriptions. YAML inventories define the nodes and eligible exits. The default grouped mode also manages accounts from inventory. In single-client mode the 3x-ui Clients page owns accounts and inbound membership.
 
 After installing its pinned requirements and building the images:
 
@@ -57,6 +57,14 @@ python3 tests/ansible.py run
 This creates a separate local Podman deployment. It tests unchanged reruns, adding a user, adding an ingress for existing accounts, and assigning an existing account to a newly added exit. Generated subscriptions and credentials remain private under `.local/ansible-test/controller`.
 
 Completed results: [docs/ansible-verification.md](docs/ansible-verification.md).
+
+## Manage one client across multiple nodes
+
+With `panel_client_mode: single`, create a VLESS client once in **3x-ui → Clients**. Select its managed REALITY inbounds, for example `in` and `in-prague`, choose `xtls-rprx-vision`, and give the user the subscription URL from that client. Happ can refresh that URL to list all permitted `country in -> country out` choices. Adding or removing one inbound changes that client's choices. Disabling the account or changing its absolute expiry applies across its inbounds on the next successful ingress sync.
+
+Each eligible exit has a stable numeric selector in the YAML inventory. 3x-ui embeds it in the VLESS UUID in each profile, and Xray routes it at the selected ingress. The panel stores one client row per user. A new ingress inherits clients attached to every previous active managed ingress. Users with selective membership can be attached explicitly in the panel.
+
+Use `PANEL_CLIENT_MODE=single ./scripts/build.sh` for the single-client control image. For a new single-mode installation, use REALITY on all ingresses, set country display names, supply a distinct `vless_route_selectors` value from 16384 through 20479 for each exit, and leave `vless_users: []`. Create users in the panel after deployment. Existing grouped installations require the [rolling migration and recovery procedure](docs/single-client-migration.md).
 
 ## Production configuration
 
@@ -78,7 +86,7 @@ Set real HTTPS Headscale and panel URLs. Install ingress TLS certificates and co
 
 In 3x-ui, create one VLESS inbound as the user directory, with the same stream settings and port as the public ingress. Bind its local listener to loopback; it is not a public ingress. Add an **External Proxy** entry per ingress with its public DNS name, VLESS port and matching TLS setting. Enable subscription service and serve it behind HTTPS. The stand seeds and verifies this pattern against 3x-ui's real subscription endpoint.
 
-Give each exit choice a distinct user UUID and unique email (e.g. `alice-eu`, `alice-us`) with separate subscription IDs (3x-ui v3 requires globally unique IDs). Map each email in ingress YAML `routes`. Each subscription fans out to the configured ingress endpoints. Clients choose the corresponding exit subscription/entry; the authenticated UUID selects the exit. Routes cannot name arbitrary destinations supplied by clients. To add a user, add its route in YAML, restart ingress with that policy, then enable the panel user. The route allowlist is intentional: unknown routes reject the snapshot.
+In the default grouped mode, give each exit choice a distinct user UUID and unique email (e.g. `alice-eu`, `alice-us`) with separate subscription IDs (3x-ui v3 requires globally unique IDs). Map each email in ingress YAML `routes`. Each subscription fans out to the configured ingress endpoints. Clients choose the corresponding exit subscription/entry; the authenticated UUID selects the exit. Routes cannot name arbitrary destinations supplied by clients. To add a user, add its route in YAML, restart ingress with that policy, then enable the panel user. The route allowlist is intentional: unknown routes reject the snapshot.
 
 Control YAML initializes admin credentials/port/path once per fresh database and preserves imported databases; the `.provisioned` marker prevents overwriting later UI changes. Rotate credentials through 3x-ui and update ingress credential files together. The panel admin and subscription listeners are published only on loopback; use an HTTPS reverse proxy for external access. Allow ingress mesh access to the panel with firewall/ACL rules.
 

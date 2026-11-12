@@ -126,7 +126,7 @@ class ControllerPersistence(unittest.TestCase):
             'ingress': {'hosts': {'in': {}}},
         }}}
         tasks = yaml.safe_load((ROOT / 'deploy/ansible/tasks/controller.yml').read_text())
-        last = next(i for i,t in enumerate(tasks) if t['name'] == 'Assemble managed user identities')
+        last = next(i for i,t in enumerate(tasks) if t['name'] == 'Read the private compatibility manifest for the ingress configuration')
         tasks = tasks[:last+1]
         tasks.append({'name': 'Inspect resulting fixture identities privately', 'ansible.builtin.copy': {
             'content': '{{ managed_users | to_json }}', 'dest': str(self.work / 'managed.json'), 'mode': '0600'},
@@ -181,6 +181,31 @@ class ControllerPersistence(unittest.TestCase):
         self.assertEqual(self.managed()[0], base)
         if WITH_RENDERER:
             self.assert_renderer(config, expanded)
+
+    def test_single_mode_keeps_cached_credentials_after_inventory_handoff(self):
+        variables = self.inventory['all']['vars']
+        variables.update(panel_client_mode='single', migrate_single_clients=True,
+                         vless_route_selectors={name: 16385 + i for i, name in enumerate(EXITS)},
+                         ingress_subscription_exits=['prague'], ingress_security='reality',
+                         ingress_reality_server_name='example.com', ingress_reality_target='example.com:443')
+        self.users[0]['additional_exits'] = EXITS[1:]
+        hosts = self.inventory['all']['children']
+        hosts['headscale']['hosts']['headscale'] = {'reality_identities': {'in': {'short_id': '01020304'}}}
+        hosts['control']['hosts']['control']['panel_directory'] = {'inbound_ids': {'in': 1}}
+        # Choose the old credential's selector explicitly to avoid a random collision in the fixture.
+        private = self.state / 'users'
+        private.mkdir(parents=True, mode=0o700)
+        (private / 'owner.uuid').write_text('11111111-1111-4ffe-8111-111111111111')
+        self.run_play()
+        expected = yaml.safe_load((self.work / 'node.yaml').read_text())['single_client']
+        self.assertEqual(expected['selectors'], {'prague': 16386})
+        self.assertEqual(len(expected['legacy']), 1)
+        self.assertEqual(len(expected['legacy'][0]['aliases']), 3)
+        self.assertEqual(expected['legacy'][0]['owner'], (private / 'owner.uuid').read_text())
+        self.assertEqual((self.state / 'single-client-legacy.json').stat().st_mode & 0o777, 0o600)
+        variables.update(migrate_single_clients=False, vless_users=[])
+        self.run_play()
+        self.assertEqual(yaml.safe_load((self.work / 'node.yaml').read_text())['single_client'], expected)
 
     def assert_renderer(self, config, users):
         spec = importlib.util.spec_from_file_location('renderer_contracts', ROOT / 'tests/validate.py')

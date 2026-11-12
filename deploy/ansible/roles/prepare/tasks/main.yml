@@ -154,7 +154,7 @@
     argv:
     - sh
     - '{{ deployment_root }}/build/{{ inventory_hostname }}/scripts/build.sh'
-  environment: '{{ container_cli_environment | combine({''CONTAINER_ENGINE'': container_engine, ''BUILD_IMAGES'': runtime_image_targets
+  environment: '{{ container_cli_environment | combine({''CONTAINER_ENGINE'': container_engine, ''PANEL_CLIENT_MODE'': panel_client_mode | default(''grouped''), ''BUILD_IMAGES'': runtime_image_targets
     | join('' '')}) }}'
   when:
   - build_images | bool
