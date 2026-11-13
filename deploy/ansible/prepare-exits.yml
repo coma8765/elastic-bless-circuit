@@ -2,7 +2,7 @@
 # Enroll new exits before site.yml advertises their subscription choices.
 # Use the complete inventory and additionally group the selected exits in new_exits.
 - name: Resolve per-host deployment settings
-  hosts: headscale:control:exits:ingress
+  hosts: headscale:control:exits:ingress:route_gateways
   gather_facts: false
   roles: [deployment_defaults]
 

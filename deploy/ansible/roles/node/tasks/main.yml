@@ -16,6 +16,20 @@
     - node_memory_swap is not defined or (node_memory_swap | default(node_memory) | human_to_bytes) >= (node_memory | human_to_bytes)
     fail_msg: Node memory must be at least 6 MiB; combined memory-swap must not be smaller than memory.
   when: container_engine == 'docker' and node_memory is defined
+- name: Verify gateway capabilities before changing the running configuration
+  ansible.builtin.command:
+    argv:
+      - '{{ container_engine }}'
+      - image
+      - inspect
+      - --format
+      - '{{ ''{{ index .Config.Labels "io.vless.geoip-gateway" }}'' }}'
+      - '{{ node_image }}'
+  environment: '{{ container_cli_environment }}'
+  register: gateway_capability
+  changed_when: false
+  failed_when: gateway_capability.rc != 0 or gateway_capability.stdout | trim != '1'
+  when: node_role == 'gateway' or (node_role == 'in' and ingress_route_gateway | default('') | length > 0)
 - name: Install only this node's mesh enrollment key
   ansible.builtin.copy:
     src: '{{ controller_state_dir }}/enrollment/{{ inventory_hostname }}.key'
@@ -40,7 +54,7 @@
     content: '{{ panel_username }}'
   - name: panel-password
     content: '{{ hostvars[groups.headscale[0]].panel_password }}'
-  when: node_role != 'out'
+  when: node_role in ['in', 'control']
   register: panel_secrets
   no_log: true
 - name: Install the exit's transit identity
@@ -51,15 +65,57 @@
   when: node_role == 'out'
   register: transit_secret
   no_log: true
-- name: Install authorized exit credentials on ingress
+- name: Install authorized exit credentials on ingress and route gateways
   ansible.builtin.copy:
     src: '{{ controller_state_dir }}/transit/{{ item }}.uuid'
-    dest: '{{ node_dir }}/secrets/{{ item }}-uuid'
+    dest: "{{ node_dir }}/secrets/{{ 'exit-' + item + '.uuid' if node_role == 'gateway' else item + '-uuid' }}"
     mode: '0600'
-  loop: '{{ groups.exits }}'
-  when: node_role == 'in'
+  loop: "{{ route_exits if node_role == 'gateway' else groups.exits }}"
+  when: node_role in ['in', 'gateway']
   register: ingress_transit
   no_log: true
+- name: Install this ingress's gateway transit credential
+  ansible.builtin.copy:
+    src: '{{ controller_state_dir }}/route-gateways/{{ ingress_route_gateway }}/{{ inventory_hostname }}.uuid'
+    dest: '{{ node_dir }}/secrets/gateway-transit.uuid'
+    mode: '0600'
+  when: node_role == 'in' and ingress_route_gateway | default('') | length > 0
+  register: gateway_transit
+  no_log: true
+- name: Install the gateway's authorized ingress identities
+  ansible.builtin.copy:
+    src: '{{ controller_state_dir }}/route-gateways/{{ inventory_hostname }}/{{ item }}.uuid'
+    dest: '{{ node_dir }}/secrets/gateway-{{ item }}.uuid'
+    mode: '0600'
+  loop: '{{ route_readers | default([]) }}'
+  when: node_role == 'gateway'
+  register: gateway_readers
+  no_log: true
+- name: Remove this ingress's Auto credential after detachment
+  ansible.builtin.file:
+    path: '{{ node_dir }}/secrets/gateway-transit.uuid'
+    state: absent
+  when: node_role == 'in' and not ingress_route_gateway | default('')
+- name: Remove retired gateway credentials
+  when: node_role == 'gateway'
+  block:
+    - name: List the managed gateway secret files
+      ansible.builtin.find:
+        paths: '{{ node_dir }}/secrets'
+        patterns: ['gateway-*.uuid', 'exit-*.uuid']
+        file_type: file
+      register: stored_gateway_secrets
+    - name: Discard credentials outside the configured gateway topology
+      ansible.builtin.file:
+        path: '{{ item.path }}'
+        state: absent
+      vars:
+        reader_keys: "{{ route_readers | map('regex_replace', '^(.*)$', 'gateway-\\1.uuid') | list }}"
+        exit_keys: "{{ route_exits | map('regex_replace', '^(.*)$', 'exit-\\1.uuid') | list }}"
+      loop: '{{ stored_gateway_secrets.files }}'
+      loop_control:
+        label: '{{ item.path | basename }}'
+      when: item.path | basename not in (reader_keys + exit_keys)
 - name: Install ingress TLS credentials
   ansible.builtin.copy:
     src: '{{ item.src }}'

@@ -33,6 +33,8 @@ Versioned links above identify the selected upstream releases where practical. D
 
 The [Xray `v26.11.9` asset workflow](https://github.com/XTLS/Xray-core/blob/v26.11.9/.github/workflows/scheduled-assets-update.yml) obtains GeoIP Lite and GeoSite assets from [XTLS/Xray-rules-dat](https://github.com/XTLS/Xray-rules-dat). That project's [source and license documentation](https://github.com/XTLS/Xray-rules-dat#source-code-and-licenses) identifies GPLv3 for the project as a whole, separate [MIT GeoSite terms](https://github.com/XTLS/Xray-rules-dat/blob/main/LICENSE-GeoSite) and [inherited terms](https://github.com/XTLS/Xray-rules-dat/blob/main/LICENSE-GeoSite-inherit). Its GeoIP and GeoSite branches document additional input sources. Record the actual data revision, applicable input-data terms and required attribution when redistributing an archive or image containing these assets. A current branch README is not a complete notice bundle for an older binary artifact.
 
+The gateway reads `country-geoip.dat` from v2fly/geoip release `202611080027`. The image includes the unmodified data and its attribution in `/usr/share/doc/vless-node/country-geoip.txt`. [Release](https://github.com/v2fly/geoip/releases/tag/202611080027), [project and DB-IP data licenses](https://github.com/v2fly/geoip/blob/202611080027/README.md#license).
+
 ## Built-image publication status
 
 The current build files are designed for local builds. They do not yet produce a complete third-party notice/source bundle suitable for asserting that a container-image release is distribution-ready:

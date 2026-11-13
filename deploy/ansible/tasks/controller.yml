@@ -5,7 +5,7 @@
       - groups.control | length == 1
       - groups.exits | length > 0
       - groups.ingress | length > 0
-      - (groups.headscale + groups.control + groups.exits + groups.ingress) | unique | length == (groups.headscale + groups.control + groups.exits + groups.ingress) | length
+      - (groups.headscale + groups.control + groups.exits + groups.ingress + groups.get('route_gateways', [])) | unique | length == (groups.headscale + groups.control + groups.exits + groups.ingress + groups.get('route_gateways', [])) | length
       - deployment_id is match('^[a-z][a-z0-9-]{0,30}$')
       - headscale_url is match('^https://[^/]+$')
       - vless_users | map(attribute='email') | unique | length == vless_users | length
@@ -33,12 +33,12 @@
     that:
       - (deployment_id + '-' + item) | length <= 63
       - item is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
-  loop: "{{ groups.control + groups.exits + groups.ingress }}"
+  loop: "{{ groups.control + groups.exits + groups.ingress + groups.get('route_gateways', []) }}"
 - name: Validate names used in paths and routes
   ansible.builtin.assert:
     that:
       - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')
-  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress }}"
+  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress + groups.get('route_gateways', []) }}"
 - name: Validate ingress subscription exit allowlists before writing secrets
   ansible.builtin.assert:
     that:
@@ -47,6 +47,24 @@
       - (hostvars[item].ingress_subscription_exits | default([]) | difference(groups.exits) | length) == 0
     fail_msg: ingress_subscription_exits must be a list of distinct existing exit inventory names.
   loop: "{{ groups.ingress }}"
+- name: Check the optional Auto route on each ingress
+  ansible.builtin.assert:
+    that:
+      - gateway_name is string
+      - (gateway_name | length > 0) == (selector is not none)
+      - not gateway_name or (panel_client_mode == 'single' and gateway_name in groups.get('route_gateways', []))
+      - not gateway_name or 'auto-gateway' not in groups.exits
+      - not gateway_name or (selector is integer and 16384 <= selector <= 20479 and selector not in vless_route_selectors.values())
+    fail_msg: Set ingress_route_gateway to an existing route_gateways host and ingress_auto_selector to an unused UUID-v4 selector in single-client mode.
+  vars:
+    gateway_name: "{{ hostvars[item].ingress_route_gateway | default('') }}"
+    selector: "{{ hostvars[item].ingress_auto_selector | default(none) }}"
+  loop: "{{ groups.ingress }}"
+- name: Validate destination pools and gateway membership
+  ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/route-gateway-policy.yml'
+  loop: "{{ groups.get('route_gateways', []) }}"
+  loop_control:
+    loop_var: gateway_host
 - name: Validate user exit assignments
   ansible.builtin.assert:
     that: ["item.exit in groups.exits"]
@@ -102,6 +120,11 @@
   delegate_to: localhost
   become: false
   no_log: true
+- name: Persist independent ingress-to-gateway transit credentials
+  ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/route-gateway-credentials.yml'
+  loop: "{{ groups.get('route_gateways', []) }}"
+  loop_control:
+    loop_var: gateway_host
 - name: Read or create the persistent panel credential
   ansible.builtin.set_fact:
     panel_password: "{{ lookup('ansible.builtin.password', controller_state_dir + '/panel-password', length=48, chars=['ascii_letters', 'digits']) }}"
@@ -130,6 +153,14 @@
       owners: "{{ (lookup('ansible.builtin.file', controller_state_dir + '/single-client-legacy.json') | from_json) if single_client_manifest.present else [] }}"
   when: panel_client_mode | default('grouped') == 'single'
   no_log: true
+- name: Check Auto selectors against existing base profile UUIDs
+  ansible.builtin.assert:
+    that: hostvars[item].ingress_auto_selector not in legacy_selectors
+    fail_msg: Choose an Auto selector that does not change a previously issued base profile.
+  vars:
+    legacy_selectors: "{{ single_client_legacy.owners | map(attribute='owner') | map('regex_replace', '^.{14}([0-9a-fA-F]{4}).*$', '\\1') | map('int', base=16) | list }}"
+  loop: '{{ groups.ingress }}'
+  when: hostvars[item].ingress_route_gateway | default('') | length > 0
 - name: Validate ingress transport selection
   ansible.builtin.assert:
     that:
@@ -165,7 +196,7 @@
   when: hostvars[item].ingress_security == 'tls'
 - name: Assemble public REALITY ingress endpoints
   ansible.builtin.set_fact:
-    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, subscription_exits=hostvars[item].ingress_subscription_exits | default([]), advertise=hostvars[item].ingress_advertised | default(true) | bool, display_country=hostvars[item].ingress_display_country | default(''), aliases=hostvars[item].ingress_advertised_aliases, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint)] }}"
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, subscription_exits=hostvars[item].ingress_subscription_exits | default([]), advertise=hostvars[item].ingress_advertised | default(true) | bool, display_country=hostvars[item].ingress_display_country | default(''), aliases=hostvars[item].ingress_advertised_aliases, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint) | combine({'auto_selector': hostvars[item].ingress_auto_selector} if hostvars[item].ingress_route_gateway | default('') else {})] }}"
   loop: "{{ groups.ingress }}"
   when: hostvars[item].ingress_security == 'reality'
   no_log: true

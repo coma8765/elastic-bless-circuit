@@ -60,3 +60,7 @@ jobs:
           sudo podman build --format docker -t localhost/vless-node:dev -f infra/Dockerfile.release .
       - name: Validate the compiled renderer and Xray configurations
         run: sudo env PATH="$PATH" "$(command -v python)" tests/validate.py
+      - name: Test GeoIP gateway routing, latency selection and failover
+        run: |
+          sudo podman pull docker.io/library/python:3.13-slim
+          sudo env PATH="$PATH" "$(command -v python)" tests/geoip_gateway.py --image localhost/vless-node:dev

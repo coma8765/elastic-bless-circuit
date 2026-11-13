@@ -47,6 +47,10 @@ options:
     type: bool
     default: false
     description: Explicitly retire verified grouped client rows and their owned subscription links during a single-mode migration.
+  defer_new_auto:
+    type: bool
+    default: false
+    description: Publish new Auto selectors only after their gateway and ingress are ready.
   route_selectors:
     type: dict
     default: {}
@@ -83,6 +87,7 @@ notes:
   - Each ingress endpoint may include aliases containing address, port, remark and optional display_country; aliases inherit its security profile and use the same directory.
   - Optional endpoint display_country and user exit_display_country produce exact country route names through owned native static external links.
   - Optional subscription_exits selects published exit identities per physical ingress; empty means all, aliases inherit, and nonempty filters require country labels.
+  - In single mode an optional ingress auto_selector adds a country -> Auto entry for the gateway. Aliases inherit the selector.
   - advertise=false prepares a directory and membership without publishing its endpoints; at least one endpoint must remain advertised.
   - The inbound remark vless-mesh-ansible-directory-v1 is reserved for this module.
   - Client comments contain an ownership marker; removing it relinquishes ownership.
@@ -384,6 +389,12 @@ def validate(params):
     labeled, _, _ = country_labels(params)
     known_exits = set(params['route_selectors']) if single else {user['exit'] for user in params['users']}
     for endpoint in params['ingress_endpoints']:
+        auto = endpoint.get('auto_selector')
+        if auto is not None:
+            if not single or type(auto) is not int or not 16384 <= auto <= 20479:
+                raise PanelError('auto_selector requires single-client mode and an integer in 16384..20479')
+            if auto in params['route_selectors'].values() or 'Auto' in params['exit_countries'].values():
+                raise PanelError('Auto must have a distinct selector and display label')
         allowed = endpoint.get('subscription_exits', [])
         if (not isinstance(allowed, list) or any(not isinstance(name, str) or
                 not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', name) for name in allowed)
@@ -506,16 +517,24 @@ def external_link_payload(row):
              ('expiryTime', 0), ('namePrefix', '')]}
 
 
-def single_proxies(params, endpoint, primary):
+def single_proxies(params, endpoint, primary, existing=None):
     """3x-ui v3.11 encodes vlessRoute in bytes 6–7 of the link's UUID."""
     advertised = [endpoint] + (endpoint.get('aliases') or [])
     result = []
     exits = endpoint.get('subscription_exits') or list(params['route_selectors'])
+    auto = endpoint.get('auto_selector')
+    if auto is not None and params.get('defer_new_auto'):
+        previous = object_value((existing or {}).get('streamSettings') or {}).get('externalProxy', [])
+        if not any(str(p.get('vlessRoute')) == str(auto) and p.get('remark', '').endswith(' -> Auto')
+                   for p in previous):
+            auto = None
     for address, proxy in zip(advertised, endpoint_proxies(endpoint, primary)):
         country = address.get('display_country') or endpoint['display_country']
         for exit_name in exits:
             result.append(dict(proxy, vlessRoute=str(params['route_selectors'][exit_name]),
                                remarkFinal=True, remark=country + ' -> ' + params['exit_countries'][exit_name]))
+        if auto is not None:
+            result.append(dict(proxy, vlessRoute=str(auto), remarkFinal=True, remark=country + ' -> Auto'))
     return result
 
 
@@ -894,7 +913,7 @@ def reconcile(module, panel, proxies):
                 advertised for physical, primary in zip(params["ingress_endpoints"], proxies) if physical.get("advertise", True)
                 for advertised in endpoint_proxies(physical, primary)]}
         if single:
-            stream['externalProxy'] = single_proxies(params, endpoint, proxies[index])
+            stream['externalProxy'] = single_proxies(params, endpoint, proxies[index], existing)
         desired = {"remark": remark, "listen": "127.0.0.1", "port": listen_port,
                    "protocol": "vless", "streamSettings": stream, "disableFlow": False,
                    "sniffing": {"enabled": False}, "expiryTime": 0, "total": 0,
@@ -1034,6 +1053,7 @@ def main():
         "route_selectors": {"type": "dict", "default": {}},
         "exit_countries": {"type": "dict", "default": {}},
         "migrate_single_clients": {"type": "bool", "default": False},
+        "defer_new_auto": {"type": "bool", "default": False},
         "url": {"type": "str", "required": True},
         "username": {"type": "str", "required": True, "no_log": True},
         "password": {"type": "str", "required": True, "no_log": True},
@@ -1054,6 +1074,7 @@ def main():
             "remark": {"type": "str", "default": ""},
             "display_country": {"type": "str", "default": ""},
             "advertise": {"type": "bool", "default": True},
+            "auto_selector": {"type": "int"},
             "subscription_exits": {"type": "list", "elements": "str", "default": []},
             "aliases": {"type": "list", "elements": "dict", "default": [], "options": {
                 "address": {"type": "str", "required": True},

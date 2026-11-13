@@ -161,10 +161,13 @@ def subscription(sub_port, token, *, expect_missing=False):
 def check_profiles(sub_port, token, identifier, endpoints):
     expected = {}
     for ep in endpoints:
-        for exit_name in ep.get('subscription_exits') or EXITS:
+        choices = [(EXITS[name], SELECTORS[name]) for name in ep.get('subscription_exits') or EXITS]
+        if ep.get('auto_selector') is not None:
+            choices.append(('Auto', ep['auto_selector']))
+        for label, selector in choices:
             parts = identifier.split('-')
-            parts[2] = format(SELECTORS[exit_name], '04x')
-            expected[(ep['address'], '-'.join(parts))] = (ep, ep['display_country'] + ' -> ' + EXITS[exit_name])
+            parts[2] = format(selector, '04x')
+            expected[(ep['address'], '-'.join(parts))] = (ep, ep['display_country'] + ' -> ' + label)
     links = subscription(sub_port, token)
     require(len(links) == len(expected), 'Incorrect number of native subscription profiles')
     for link in links:
@@ -263,6 +266,14 @@ def exercise(api, url, sub_port, password):
     check_profiles(sub_port, token, base_uuid, ends)
     require(not reconcile(**single)['changed'], 'Single-client directory rerun changed steady state')
     print('PASS one migrated client owns both inbounds and all four exit choices')
+
+    ends[0]['auto_selector'] = 16420
+    reconcile(**single, defer_new_auto=True)
+    check_profiles(sub_port, token, base_uuid, [dict(ends[0], auto_selector=None), ends[1]])
+    reconcile(**single)
+    check_profiles(sub_port, token, base_uuid, ends)
+    require(not reconcile(**single, defer_new_auto=True)['changed'], 'A staged rerun removed a published Auto')
+    print('PASS original subscription gains Auto only on its opted-in ingress after publication')
 
     inbound = directory_ids['in-prague']
     membership(owner, 'detach', inbound)

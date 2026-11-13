@@ -2,7 +2,7 @@
 # Optional image preparation without enrolling nodes or changing running services.
 # site.yml also performs this stage when build_images is true.
 - name: Prepare container images and runtime hosts
-  hosts: headscale:control:exits:ingress
+  hosts: headscale:control:exits:ingress:route_gateways
   gather_facts: true
   serial: 1
   roles: [deployment_defaults, prepare]

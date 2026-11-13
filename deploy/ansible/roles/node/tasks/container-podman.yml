@@ -5,7 +5,7 @@
     state: started
     restart_policy: always
     recreate: '{{ node_config.changed or mesh_secret.changed or mesh_ca.changed or panel_secrets.changed or transit_secret.changed
-      or ingress_transit.changed or ingress_certs.changed or ingress_reality.changed }}'
+      or ingress_transit.changed or ingress_certs.changed or ingress_reality.changed or gateway_transit.changed or gateway_readers.changed }}'
     network: '{{ container_network }}'
     publish: '{{ mesh_udp_publish + ([''127.0.0.1:'' + (panel_host_port | string) + '':2053/tcp'', ''127.0.0.1:'' + (subscription_host_port
       | string) + '':2096/tcp''] if node_role == ''control'' else (ingress_publish if node_role == ''in'' else [])) }}'

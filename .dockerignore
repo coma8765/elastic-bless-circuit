@@ -9,3 +9,4 @@
 !infra/entrypoint.sh
 !infra/3x-ui/
 !infra/3x-ui/*.patch
+!infra/country-geoip-notice.txt

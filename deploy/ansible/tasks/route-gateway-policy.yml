@@ -1,0 +1,39 @@
+---
+- name: Validate the gateway's mesh listener, probe and country pools
+  ansible.builtin.assert:
+    that:
+      - (groups.control + groups.ingress + groups.route_gateways) | map('extract', hostvars, 'panel_client_mode') | unique | list == ['single']
+      - panel_client_mode == 'single'
+      - hostvars[gateway_host].container_name != deployment_id + '-gateway'
+      - hostvars[gateway_host].transit_port is integer and 1 <= hostvars[gateway_host].transit_port <= 65535
+      - hostvars[gateway_host].route_gateway_countries is mapping
+      - hostvars[gateway_host].route_gateway_countries | length > 0
+      - hostvars[gateway_host].route_gateway_probe_interval_seconds is integer
+      - 1 <= hostvars[gateway_host].route_gateway_probe_interval_seconds <= 3600
+      - hostvars[gateway_host].route_gateway_probe_url is string
+      - hostvars[gateway_host].route_gateway_probe_url is match('^https://[^/?#@\s]+(?:/[^#\s]*)?$')
+    fail_msg: Use a dedicated mesh container name (the deployment's -gateway name belongs to nginx), an HTTPS probe and nonempty destination country pools.
+- name: Validate the exit inventory members of each country pool
+  ansible.builtin.assert:
+    that:
+      - item.key is string and item.key is match('^[A-Z]{2}$')
+      - item.value | type_debug == 'list' and item.value | length > 0
+      - item.value | unique | length == item.value | length
+      - item.value | difference(groups.exits) | length == 0
+    fail_msg: Each country must be an uppercase two-letter code mapped to a nonempty list of distinct exit inventory names.
+  loop: "{{ hostvars[gateway_host].route_gateway_countries | dict2items }}"
+- name: Determine gateway readers and eligible exits
+  ansible.builtin.set_fact:
+    route_readers: "{{ groups.ingress | map('extract', hostvars) | selectattr('ingress_route_gateway', 'equalto', gateway_host) | map(attribute='inventory_hostname') | list }}"
+    route_exits: "{{ hostvars[gateway_host].route_gateway_countries.values() | list | flatten | unique | sort }}"
+  delegate_to: '{{ gateway_host }}'
+  delegate_facts: true
+- name: Require at least one authorized ingress for the gateway
+  ansible.builtin.assert:
+    that: hostvars[gateway_host].route_readers | length > 0
+    fail_msg: Assign this gateway to one or more ingresses with ingress_route_gateway.
+- name: Require an available country route for each participating ingress
+  ansible.builtin.assert:
+    that: hostvars[gateway_host].route_exits | intersect(hostvars[item].ingress_subscription_exits or groups.exits) | length > 0
+    fail_msg: The ingress exit allowlist has no intersection with this gateway's configured pools.
+  loop: "{{ hostvars[gateway_host].route_readers }}"

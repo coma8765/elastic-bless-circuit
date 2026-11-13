@@ -12,6 +12,9 @@ printf '%s  /tmp/xray.zip\n' "$xsha" | sha256sum -c -
 unzip -q /tmp/xray.zip -d /tmp/xray
 cp /tmp/xray/xray /opt/bin/
 cp /tmp/xray/*.dat /opt/share/
+# Preserve the bundled Xray categories. Auto uses a separate full country database.
+curl --fail --location --retry 4 https://github.com/v2fly/geoip/releases/download/202611080027/geoip.dat -o /opt/share/country-geoip.dat
+echo 'eedb24b3b9fcba27e06b92c0428dab90d9496083091ae4cf39e11387fd99d0e2  /opt/share/country-geoip.dat' | sha256sum -c -
 file="tailscale_${TAILSCALE_VERSION}_${tarch}.tgz"
 curl --fail --location --retry 4 "https://pkgs.tailscale.com/stable/$file" -o /tmp/ts.tgz
 curl --fail --location --retry 4 "https://pkgs.tailscale.com/stable/$file.sha256" -o /tmp/ts.sha
