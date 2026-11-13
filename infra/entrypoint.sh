@@ -4,7 +4,8 @@ set -eu
 if [ "${1:-}" != node-agent ] || { [ "${2:-}" != run ] && [ "${2:-}" != control ]; }; then exec "$@"; fi
 mkdir -p /run/tailscale /var/lib/tailscale
 rm -f /run/node/ready
-tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --port=41641 &
+mesh_udp_port=$(node-agent mesh-port "$3")
+tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --port="$mesh_udp_port" &
 mesh=$!
 i=0
 while [ ! -S /var/run/tailscale/tailscaled.sock ]; do

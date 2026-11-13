@@ -2,7 +2,13 @@
 - name: Resolve per-host deployment settings
   hosts: headscale:control:exits:ingress
   gather_facts: false
+  any_errors_fatal: true
   roles: [deployment_defaults]
+  tasks:
+    - name: Require the rolling playbook for a grouped client migration
+      ansible.builtin.assert:
+        that: not (migrate_single_clients | bool)
+        fail_msg: Use migrate-single-client.yml to back up the database and upgrade every ingress before converting clients.
 
 - name: Validate topology and prepare controller credentials
   hosts: headscale
@@ -12,12 +18,28 @@
       ansible.builtin.include_tasks: tasks/controller.yml
       run_once: true
 
-- name: Prepare Podman hosts and images
+- name: Prepare container hosts and images
   hosts: headscale:control:exits:ingress
   gather_facts: true
   # Local inventory maps several logical services to one physical machine.
   serial: 1
   roles: [prepare]
+
+- name: Check existing directory ownership before starting the single-client control service
+  hosts: control
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Read the current deployment and verify a normal single-client update is safe
+      when: panel_client_mode == 'single'
+      block:
+        - ansible.builtin.include_tasks: tasks/container-ownership.yml
+          vars:
+            owned_container_name: '{{ container_name }}'
+        - ansible.builtin.include_tasks: tasks/single-client-panel-preflight.yml
+          vars:
+            migration_preflight: false
+          when: candidate_container_owner.rc == 0
 
 - name: Deploy Headscale and issue per-node enrollment keys
   hosts: headscale

@@ -3,6 +3,7 @@ role: {{ node_role }}
 {% endif %}
 mesh:
   enabled: true
+  udp_port: {{ mesh_udp_port | int }}
   server: {{ headscale_url | to_json }}
   hostname: {{ container_name | to_json }}
   auth_key_file: /run/secrets/headscale-key
@@ -16,6 +17,10 @@ panel_settings:
 listener: {address: mesh, port: {{ transit_port }}}
 transit_uuid_file: /run/secrets/transit-uuid
 allow_private_destinations: {{ allow_private_destinations | bool | lower }}
+{% if exit_dns_servers | default([]) | length > 0 %}
+dns:
+  servers: {{ exit_dns_servers | to_json }}
+{% endif %}
 {% else %}
 sync_seconds: {{ sync_seconds }}
 max_stale_seconds: {{ max_stale_seconds }}
@@ -24,18 +29,27 @@ listener:
   port: {{ ingress_port }}
   stream:
     network: tcp
-    security: tls
+    security: {{ ingress_security }}
+{% if ingress_security == 'reality' %}
+    realitySettings:
+      target: {{ ingress_reality_target | to_json }}
+      serverNames: [{{ ingress_reality_server_name | to_json }}]
+      private_key_file: /run/secrets/reality-private-key
+      shortIds: [{{ hostvars[groups.headscale[0]].reality_identities[inventory_hostname].short_id | to_json }}]
+      xver: 0
+{% else %}
     tlsSettings:
       certificates:
         - certificateFile: /run/secrets/fullchain.pem
           keyFile: /run/secrets/privkey.pem
+{% endif %}
 panel:
   # HTTP is carried exclusively inside authenticated WireGuard, never public IPs.
   url: http://{{ hostvars[groups.control[0]].mesh_ip }}:2053
   allow_http: true
   username_file: /run/secrets/panel-user
   password_file: /run/secrets/panel-password
-  inbound_id: {{ hostvars[groups.control[0]].panel_directory.inbound_id }}
+  inbound_id: {{ hostvars[groups.control[0]].panel_directory.inbound_ids[inventory_hostname] if ingress_security == 'reality' else hostvars[groups.control[0]].panel_directory.inbound_id }}
 exits:
 {% for peer in groups.exits %}
   - name: {{ peer | to_json }}
@@ -43,8 +57,14 @@ exits:
     port: {{ hostvars[peer].transit_port }}
     uuid_file: /run/secrets/{{ peer }}-uuid
 {% endfor %}
+{% if panel_client_mode | default('grouped') == 'single' %}
+single_client:
+  selectors: {{ vless_route_selectors | dict2items | selectattr('key', 'in', ingress_subscription_exits | default([]) or groups.exits) | list | items2dict | to_json }}
+  legacy: {{ hostvars[groups.headscale[0]].single_client_legacy.owners | to_json }}
+{% else %}
 routes:
-{% for user in vless_users %}
+{% for user in hostvars[groups.headscale[0]].managed_users %}
   {{ user.email | to_json }}: {{ user.exit | to_json }}
 {% endfor %}
+{% endif %}
 {% endif %}

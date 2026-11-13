@@ -1,5 +1,5 @@
 server_url: {{ headscale_url | to_json }}
-listen_addr: 0.0.0.0:443
+listen_addr: 0.0.0.0:{{ 8080 if (headscale_external_tls | bool) else 443 }}
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443
 noise:
@@ -29,5 +29,5 @@ log:
   level: warn
 disable_check_updates: true
 unix_socket: /var/run/headscale/headscale.sock
-tls_cert_path: /etc/headscale/cert.pem
-tls_key_path: /etc/headscale/key.pem
+tls_cert_path: {{ '""' if (headscale_external_tls | bool) else '/etc/headscale/cert.pem' }}
+tls_key_path: {{ '""' if (headscale_external_tls | bool) else '/etc/headscale/key.pem' }}

@@ -1,0 +1,43 @@
+---
+# Enroll new exits before site.yml advertises their subscription choices.
+# Use the complete inventory and additionally group the selected exits in new_exits.
+- name: Resolve per-host deployment settings
+  hosts: headscale:control:exits:ingress
+  gather_facts: false
+  roles: [deployment_defaults]
+
+- name: Validate expansion and prepare persistent controller identities
+  hosts: headscale
+  gather_facts: false
+  tasks:
+    - name: Require an explicitly selected set of exit inventory hosts
+      ansible.builtin.assert:
+        that:
+          - groups.new_exits | default([]) | length > 0
+          - groups.new_exits | default([]) | difference(groups.exits) | length == 0
+        fail_msg: Add only the intended exit hosts to new_exits in the complete inventory.
+    - name: Prepare controller credentials without publishing panel changes
+      ansible.builtin.include_tasks: tasks/controller.yml
+      run_once: true
+
+- name: Prepare only the selected exit hosts
+  hosts: new_exits
+  gather_facts: true
+  serial: 1
+  roles: [prepare]
+
+- name: Issue enrollment keys using the existing Headscale service
+  hosts: headscale
+  gather_facts: false
+  tasks:
+    - name: Provision only selected exit enrollment credentials
+      ansible.builtin.include_tasks: roles/headscale/tasks/enrollment.yml
+      loop: '{{ groups.new_exits }}'
+      loop_control:
+        loop_var: mesh_node
+
+- name: Bring selected exits online before publishing their routes
+  hosts: new_exits
+  gather_facts: false
+  serial: 1
+  roles: [node]

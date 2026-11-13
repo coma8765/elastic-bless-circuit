@@ -6,6 +6,8 @@ This is a reference implementation with local integration tests, not a productio
 
 The client sends a VLESS UUID. Xray authenticates it and assigns the configured email. A routing rule maps that email to a named transit outbound. Separate UUID/email pairs let a client select different exits on the same public ingress port. The transit connection uses a different UUID; exits never receive public user credentials. Ingress must never have a Freedom outbound, including as an error fallback.
 
+Ansible's optional user `additional_exits` list groups those exit identities in the base account's existing public subscription. The base email, UUID, token and primary exit stay unchanged. Each additional configured exit gets a persistent `base--exit` email/UUID pair and a distinct private backend subscription ID derived from its owner's token. The same validated expansion supplies panel identities and ingress routes. The panel's native external-link API includes actual generated child VLESS links in the owner's subscription, with one link per identity and advertised ingress address. It preserves unrelated external links and never fetches arbitrary remote subscriptions. Disabling the base account disables its whole group; removing an additional exit disables that identity and retires its managed share links while retaining its UUID for later re-addition. This adds egress choices through existing ingress nodes without exposing the exit listeners to the Internet.
+
 The exit address is an operator-configured mesh address, not client-controlled routing input. For Xray versions that reject numeric CGNAT plain-VLESS destinations, the renderer creates internal `transit-N.mesh.invalid` aliases, pins them to the configured mesh IP in Xray DNS, and resolves them with `UseIPv4`. These aliases do not use external DNS. Transit sockets bind `tailscale0` when mesh enrollment is enabled, so losing the mesh route cannot send them through the default interface. Exits accept traffic on their Tailscale interface only. WireGuard authenticates/encrypts the mesh and a separate VLESS credential authenticates the ingress to the exit. Rotate transit UUIDs with a coordinated ingress/exit rollout. For overlapping rotation, deploy a replacement exit and migrate routes before retiring the old exit.
 
 ## Networking boundaries
@@ -32,6 +34,12 @@ Adapt administrative identity/tag ownership to your Headscale users and validate
 Headscale outages do not necessarily interrupt established peer communication, but discovery, new enrollment and topology updates depend on it. DERP preserves connectivity when direct UDP is unavailable; monitor direct-versus-relayed paths. Do not disable fallback solely to claim P2P. The local direct-path check uses `tailscale ping --until-direct=true` for both exits.
 
 Control's admin/API listener is reachable by authorized ingress nodes over the mesh. Admin and subscriptions should have separate HTTPS reverse proxy routes: admin authenticated/private, subscription public with unguessable per-user subscription IDs. Never expose the directory inbound as a data-plane entry point. Its `externalProxy` metadata tells subscriptions to use the real ingress public endpoints.
+
+## Mesh UDP port alignment
+
+`mesh.udp_port` selects the actual `tailscaled` listener from YAML and defaults to 41641. The entrypoint validates it with `node-agent mesh-port /etc/node/config.yaml` before starting the daemon. The command works for control YAML without a data-plane role and rejects nonnumeric or out-of-range ports.
+
+When the host already runs Tailscale on UDP 41641, choose another port for the container, for example `mesh.udp_port: 41642`, and publish **41642:41642/udp**. Keep the daemon port, Docker/Podman host publication and any upstream NAT forwarding aligned. Merely publishing 41642 to an unchanged container port 41641 can collide with the host daemon's outgoing NAT state and leave peers using DERP. In Ansible, set the per-host `mesh_udp_port` and matching `mesh_udp_publish` together. Distinct colocated node containers also need distinct ports. Port alignment helps direct reachability; provider firewall/NAT behavior must still permit the resulting UDP endpoint.
 
 ## Configuration lifecycle
 

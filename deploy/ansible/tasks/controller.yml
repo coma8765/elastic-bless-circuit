@@ -11,6 +11,23 @@
       - vless_users | map(attribute='email') | unique | length == vless_users | length
       - not ansible_check_mode
     fail_msg: "Use the complete inventory; initial provisioning cannot run in check mode."
+- name: Validate panel client mode and migration intent
+  ansible.builtin.assert:
+    that:
+      - panel_client_mode | default('grouped') in ['grouped', 'single']
+      - not (migrate_single_clients | default(false) | bool) or panel_client_mode == 'single'
+- name: Validate stable native VLESS route selectors
+  ansible.builtin.assert:
+    that:
+      - vless_route_selectors is mapping
+      - (vless_route_selectors.keys() | sort) == (groups.exits | sort)
+      - (vless_route_selectors.values() | select('integer') | list | length) == (groups.exits | length)
+      - (vless_route_selectors.values() | unique | length) == (groups.exits | length)
+      - vless_route_selectors.values() | min >= 16384
+      - vless_route_selectors.values() | max <= 20479
+      - groups.ingress | map('extract', hostvars, 'ingress_security') | unique | list == ['reality']
+    fail_msg: Single-client mode requires REALITY inbounds and a unique stable UUID-v4 selector (16384..20479) for every exit.
+  when: panel_client_mode | default('grouped') == 'single'
 - name: Validate stable mesh hostnames
   ansible.builtin.assert:
     that:
@@ -21,27 +38,45 @@
   ansible.builtin.assert:
     that:
       - item is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')
-  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress + (vless_users | map(attribute='email') | list) }}"
+  loop: "{{ groups.headscale + groups.control + groups.exits + groups.ingress }}"
+- name: Validate ingress subscription exit allowlists before writing secrets
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].ingress_subscription_exits | default([]) | type_debug == 'list'
+      - (hostvars[item].ingress_subscription_exits | default([]) | unique | length) == (hostvars[item].ingress_subscription_exits | default([]) | length)
+      - (hostvars[item].ingress_subscription_exits | default([]) | difference(groups.exits) | length) == 0
+    fail_msg: ingress_subscription_exits must be a list of distinct existing exit inventory names.
+  loop: "{{ groups.ingress }}"
 - name: Validate user exit assignments
   ansible.builtin.assert:
     that: ["item.exit in groups.exits"]
   loop: "{{ vless_users }}"
   loop_control: {label: "{{ item.email }}"}
+- name: Validate and expand subscription exit identities before writing secrets
+  vless_user_routes:
+    users: "{{ vless_users }}"
+    exits: "{{ groups.exits }}"
+  register: expanded_user_routes
+  no_log: true
+- name: Retain the validated expanded subscription route map
+  ansible.builtin.set_fact:
+    expanded_users: "{{ expanded_user_routes.expanded_users }}"
+  no_log: true
 - name: Prepare private controller directories
   ansible.builtin.file:
     path: "{{ controller_state_dir }}/{{ item }}"
     state: directory
     mode: '0700'
-  loop: ['', tls, users, transit, enrollment]
+  loop: ['', tls, users, transit, enrollment, reality]
   delegate_to: localhost
   become: false
 - name: Persist UUID entropy and subscription tokens
   ansible.builtin.copy:
-    dest: "{{ controller_state_dir }}/users/{{ item.email }}.{{ suffix }}"
+    dest: "{{ controller_state_dir }}/users/{{ item.identity_key | default(item.email) }}.{{ suffix }}"
     content: "{{ (lookup('ansible.builtin.password', '/dev/null', length=48, chars=['ascii_letters', 'digits']) | to_uuid) if suffix == 'uuid' else lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
     force: false
     mode: '0600'
-  loop: "{{ vless_users }}"
+  loop: "{{ expanded_users }}"
   loop_control: {label: "{{ item.email }}"}
   vars: {suffix: uuid}
   delegate_to: localhost
@@ -49,7 +84,7 @@
   no_log: true
 - name: Persist subscription tokens
   ansible.builtin.copy:
-    dest: "{{ controller_state_dir }}/users/{{ item.email }}.sub"
+    dest: "{{ controller_state_dir }}/users/{{ item.identity_key | default(item.email) }}.sub"
     content: "{{ lookup('ansible.builtin.password', '/dev/null', length=40, chars=['ascii_letters', 'digits']) }}"
     force: false
     mode: '0600'
@@ -75,13 +110,65 @@
   no_log: true
 - name: Assemble managed user identities
   ansible.builtin.set_fact:
-    managed_users: "{{ managed_users + [dict(email=item.email, exit=item.exit, uuid=lookup('file', controller_state_dir + '/users/' + item.email + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + item.email + '.sub'), enabled=item.enabled | default(true))] }}"
-  loop: "{{ vless_users }}"
+    managed_users: "{{ managed_users + [dict(email=item.email, subscription_owner=item.base_email, exit=item.exit, exit_display_country=hostvars[item.exit].exit_display_country | default(''), uuid=lookup('file', controller_state_dir + '/users/' + (item.identity_key | default(item.email)) + '.uuid'), sub_id=lookup('file', controller_state_dir + '/users/' + (item.base_identity_key | default(item.base_email)) + '.sub'), enabled=item.enabled) | combine({'expiry_time': item.expiry_time} if 'expiry_time' in item else {}) | combine({'metadata': item.metadata} if 'metadata' in item else {})] }}"
+  loop: "{{ expanded_users }}"
   no_log: true
-- name: Assemble public ingress endpoints
+- name: Prepare owner-bound credentials for previously downloaded profiles
+  vless_single_client_legacy:
+    users: '{{ managed_users }}'
+    selectors: '{{ vless_route_selectors }}'
+    path: '{{ controller_state_dir }}/single-client-legacy.json'
+    migrate: '{{ migrate_single_clients | default(false) | bool }}'
+  delegate_to: localhost
+  become: false
+  register: single_client_manifest
+  when: panel_client_mode | default('grouped') == 'single'
+  no_log: true
+- name: Read the private compatibility manifest for the ingress configuration
   ansible.builtin.set_fact:
-    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
+    single_client_legacy:
+      owners: "{{ (lookup('ansible.builtin.file', controller_state_dir + '/single-client-legacy.json') | from_json) if single_client_manifest.present else [] }}"
+  when: panel_client_mode | default('grouped') == 'single'
+  no_log: true
+- name: Validate ingress transport selection
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].ingress_security in ['tls', 'reality']
   loop: "{{ groups.ingress }}"
+- name: Require consistent flow semantics across managed ingress nodes
+  ansible.builtin.assert:
+    that:
+      - groups.ingress | map('extract', hostvars, 'ingress_security') | unique | length == 1
+    fail_msg: "Use separate control deployments for TLS and REALITY ingress; shared users have one flow setting."
+- name: Persist independent REALITY identities on the controller
+  vless_reality_key:
+    path: "{{ controller_state_dir }}/reality/{{ item }}.json"
+  loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'reality'
+  register: reality_keys
+  delegate_to: localhost
+  become: false
+  no_log: true
+- name: Initialize public REALITY identity map
+  ansible.builtin.set_fact:
+    reality_identities: {}
+- name: Assemble public REALITY metadata
+  ansible.builtin.set_fact:
+    reality_identities: "{{ reality_identities | combine({item.item: dict(public_key=item.public_key, short_id=item.short_id)}) }}"
+  loop: "{{ reality_keys.results }}"
+  when: not (item.skipped | default(false))
+  no_log: true
+- name: Assemble public TLS ingress endpoints
+  ansible.builtin.set_fact:
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, subscription_exits=hostvars[item].ingress_subscription_exits | default([]), advertise=hostvars[item].ingress_advertised | default(true) | bool, display_country=hostvars[item].ingress_display_country | default(''), aliases=hostvars[item].ingress_advertised_aliases, security='tls', tls_server_name=hostvars[item].ingress_server_name)] }}"
+  loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'tls'
+- name: Assemble public REALITY ingress endpoints
+  ansible.builtin.set_fact:
+    ingress_endpoints: "{{ ingress_endpoints + [dict(address=hostvars[item].ingress_public_address, port=hostvars[item].ingress_public_port | int, remark=item, subscription_exits=hostvars[item].ingress_subscription_exits | default([]), advertise=hostvars[item].ingress_advertised | default(true) | bool, display_country=hostvars[item].ingress_display_country | default(''), aliases=hostvars[item].ingress_advertised_aliases, security='reality', reality_target=hostvars[item].ingress_reality_target, reality_public_key=reality_identities[item].public_key, reality_short_id=reality_identities[item].short_id, reality_server_name=hostvars[item].ingress_reality_server_name, reality_fingerprint=hostvars[item].ingress_reality_fingerprint)] }}"
+  loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'reality'
+  no_log: true
 - name: Generate local test certificates only
   ansible.builtin.command:
     argv:
@@ -108,7 +195,9 @@
   vars:
     cert_name: "{{ (headscale_url | urlsplit('hostname')) if item == 'headscale' else ('subscriptions.vless.test' if item == 'control' else hostvars[item].ingress_server_name) }}"
   loop: "{{ ['headscale', 'control'] + groups.ingress }}"
-  when: local_mode | bool
+  when:
+    - local_mode | bool
+    - (item == 'headscale' and not (headscale_external_tls | bool)) or (item == 'control' and (gateway_enabled | bool)) or (item in groups.ingress and hostvars[item].ingress_security == 'tls')
   delegate_to: localhost
   become: false
   no_log: true
@@ -117,7 +206,9 @@
     path: "{{ controller_state_dir }}/tls/{{ item }}.key"
     mode: '0600'
   loop: "{{ ['headscale', 'control'] + groups.ingress }}"
-  when: local_mode | bool
+  when:
+    - local_mode | bool
+    - (item == 'headscale' and not (headscale_external_tls | bool)) or (item == 'control' and (gateway_enabled | bool)) or (item in groups.ingress and hostvars[item].ingress_security == 'tls')
   delegate_to: localhost
   become: false
 - name: Validate control certificates before changing remote services
@@ -126,8 +217,9 @@
     key_path: "{{ item.key }}"
     hostname: "{{ item.hostname }}"
   loop:
-    - {cert: "{{ headscale_tls_cert }}", key: "{{ headscale_tls_key }}", hostname: "{{ headscale_url | urlsplit('hostname') }}"}
-    - {cert: "{{ control_tls_cert }}", key: "{{ control_tls_key }}", hostname: "{{ subscription_public_url | urlsplit('hostname') }}"}
+    - {cert: "{{ headscale_tls_cert }}", key: "{{ headscale_tls_key }}", hostname: "{{ headscale_url | urlsplit('hostname') }}", enabled: "{{ not (headscale_external_tls | bool) }}"}
+    - {cert: "{{ control_tls_cert }}", key: "{{ control_tls_key }}", hostname: "{{ subscription_public_url | urlsplit('hostname') }}", enabled: "{{ gateway_enabled | bool }}"}
+  when: item.enabled | bool
   delegate_to: localhost
   become: false
 - name: Validate ingress certificates before changing remote services
@@ -136,6 +228,7 @@
     key_path: "{{ hostvars[item].ingress_tls_key }}"
     hostname: "{{ hostvars[item].ingress_server_name }}"
   loop: "{{ groups.ingress }}"
+  when: hostvars[item].ingress_security == 'tls'
   delegate_to: localhost
   become: false
 - name: Write private subscription handoff data
@@ -144,7 +237,8 @@
     content: "{{ subscription_links | to_nice_json }}\n"
     mode: '0600'
   vars:
-    subscription_links: "{{ dict(managed_users | map(attribute='email') | zip(managed_users | map(attribute='sub_id') | map('regex_replace', '^', subscription_public_url + '/sub/'))) }}"
+    public_users: "{{ managed_users | selectattr('email', 'in', vless_users | map(attribute='email') | list) | list }}"
+    subscription_links: "{{ dict(public_users | map(attribute='email') | zip(public_users | map(attribute='sub_id') | map('regex_replace', '^', subscription_public_url + '/sub/'))) }}"
   delegate_to: localhost
   become: false
   no_log: true

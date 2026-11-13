@@ -1,0 +1,19 @@
+- name: Start the HTTPS coordination server
+  containers.podman.podman_container:
+    name: '{{ container_name }}'
+    image: '{{ headscale_image }}'
+    state: started
+    recreate: '{{ headscale_config.changed or headscale_policy.changed or headscale_certs.changed }}'
+    restart_policy: always
+    network: '{{ container_network }}'
+    publish: '{{ headscale_publish }}'
+    security_opt:
+    - label=disable
+    - no-new-privileges
+    volume:
+    - '{{ node_dir | realpath }}:/etc/headscale:ro'
+    - '{{ container_name }}-state:/var/lib/headscale'
+    label:
+      io.vless.deployment: '{{ deployment_id }}'
+    dns: '{{ container_dns_servers }}'
+    etc_hosts: '{{ container_extra_hosts }}'

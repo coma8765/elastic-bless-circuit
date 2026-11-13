@@ -1,0 +1,30 @@
+- name: Start the Docker HTTPS coordination server
+  community.docker.docker_container:
+    name: '{{ container_name }}'
+    image: '{{ headscale_image }}'
+    docker_host: '{{ docker_host }}'
+    state: started
+    restart_policy: always
+    recreate: '{{ headscale_config.changed or headscale_policy.changed or headscale_certs.changed }}'
+    pull: never
+    container_default_behavior: no_defaults
+    network_mode: '{{ container_network }}'
+    networks:
+    - name: '{{ container_network }}'
+    published_ports: '{{ headscale_publish }}'
+    security_opts:
+    - no-new-privileges:true
+    volumes:
+    - '{{ node_dir | realpath }}:/etc/headscale:ro'
+    - '{{ container_name }}-state:/var/lib/headscale'
+    labels:
+      io.vless.deployment: '{{ deployment_id }}'
+    comparisons:
+      networks: strict
+      # Docker defaults to keeping extra published ports; removals must close them.
+      published_ports: strict
+      dns_servers: strict
+      etc_hosts: strict
+      labels: allow_more_present
+    dns_servers: '{{ container_dns_servers }}'
+    etc_hosts: '{{ container_extra_hosts }}'
