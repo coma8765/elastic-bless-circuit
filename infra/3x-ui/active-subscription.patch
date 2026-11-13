@@ -1,0 +1,40 @@
+--- a/internal/sub/controller.go
++++ b/internal/sub/controller.go
+@@ -21,6 +21,7 @@
+ 
+ 	"github.com/gin-gonic/gin"
+ 
++	"github.com/mhsanaei/3x-ui/v3/internal/database"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
+ )
+@@ -765,6 +766,29 @@
+ 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+ 	c.Header("Pragma", "no-cache")
+ 	c.Header("Expires", "0")
++	c.Header("X-Mesh-Client-Mode", "single")
++
++	// A subscription token belongs to one live owner. Check it before HTML,
++	// URI, JSON, or Clash rendering, including operator-supplied external links.
++	token := c.Param("subid")
++	now := time.Now().UnixMilli()
++	var eligible int64
++	err := database.GetDB().Table("clients").
++		Where("sub_id = ? AND (SELECT COUNT(*) FROM clients WHERE sub_id = ?) = 1", token, token).
++		Where("enable = ? AND (expiry_time = 0 OR expiry_time > ?)", true, now).
++		Where("total_gb = 0 AND limit_ip = 0 AND limit_hwid = 0").
++		Where(`EXISTS (SELECT 1 FROM client_inbounds ci JOIN inbounds i ON i.id = ci.inbound_id
++			WHERE ci.client_id = clients.id AND i.enable = ? AND (i.expiry_time = 0 OR i.expiry_time > ?)
++			AND (i.exclude_from_sub = ? OR (i.remark LIKE ? AND EXISTS (
++				SELECT 1 FROM client_external_links l WHERE l.client_id = clients.id
++				AND l.kind = 'link' AND l.name_prefix LIKE ? AND l.enable = ?))))`,
++			true, now, false, "vless-mesh-ansible-directory-v1:%", "vless-mesh-ansible:%", true).
++		Count(&eligible).Error
++	if err != nil {
++		c.AbortWithStatus(http.StatusServiceUnavailable)
++	} else if eligible != 1 {
++		c.AbortWithStatus(http.StatusNotFound)
++	}
+ }
+ 
+ // loadSubTemplate returns the parsed custom subscription template located in

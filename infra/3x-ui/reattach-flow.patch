@@ -1,0 +1,23 @@
+--- a/internal/web/service/client_crud.go
++++ b/internal/web/service/client_crud.go
+@@ -1139,11 +1139,15 @@
+ 	}
+ 
+ 	clientWire := existing.ToClient()
+-	flow, ffErr := s.EffectiveFlow(nil, id)
+-	if ffErr != nil {
+-		return false, ffErr
+-	}
+-	clientWire.Flow = flow
++	// A detached client has no per-inbound override. Use its stored flow
++	// when attaching its first inbound, as BulkAttach already does.
++	if len(currentIds) > 0 {
++		flow, ffErr := s.EffectiveFlow(nil, id)
++		if ffErr != nil {
++			return false, ffErr
++		}
++		clientWire.Flow = flow
++	}
+ 	clientWire.UpdatedAt = time.Now().UnixMilli()
+ 
+ 	// If this identity has no CURRENT WireGuard/AmneziaWG attachment,

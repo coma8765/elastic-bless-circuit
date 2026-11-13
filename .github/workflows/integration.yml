@@ -16,7 +16,7 @@ jobs:
   integration:
     name: Mesh, recovery and Ansible topology growth
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +38,9 @@ jobs:
           .local/ansible-venv/bin/python -m pip install -r deploy/ansible/requirements.txt
           .local/ansible-venv/bin/ansible-galaxy collection install -r deploy/ansible/requirements.yml -p .local/ansible-collections
       - name: Build all Debian service images
-        run: sudo env PATH="$PATH" ./scripts/build.sh
+        run: sudo env PATH="$PATH" PANEL_CLIENT_MODE=single ./scripts/build.sh
+      - name: Prepare the official Python DNS canary image
+        run: sudo podman pull docker.io/library/python:3.13-slim
       - name: Check container networking capabilities
         run: |
           sudo podman run --rm --no-healthcheck --cap-add=NET_ADMIN --device=/dev/net/tun --security-opt=label=disable --entrypoint /bin/sh localhost/vless-node:dev -c 'ip tuntap add dev ci-probe mode tun && ip link show ci-probe'
@@ -57,6 +59,31 @@ jobs:
               exit 1
             fi
           done
+      - name: Test REALITY identities and isolated panel subscriptions
+        run: |
+          if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/container_overrides.py --engine podman > .local/ci-private/container-overrides.log 2>&1; then
+            echo "::error::Container DNS/hosts override reconciliation failed."
+            exit 1
+          fi
+          if ! .local/ansible-venv/bin/python tests/reality_keys.py > .local/ci-private/reality-keys.log 2>&1; then
+            echo "::error::REALITY identity persistence or security checks failed."
+            exit 1
+          fi
+          if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/reality_panel.py > .local/ci-private/reality-panel.log 2>&1; then
+            echo "::error::Isolated REALITY/Vision subscription or account/node continuity checks failed. Generated credentials are not uploaded."
+            exit 1
+          fi
+          echo 'REALITY identity persistence, Vision subscription metadata and distinct-key ingress growth checks passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Test native single-client subscriptions with the patched panel
+        run: |
+          sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/single_client_integration.py --engine podman --image localhost/vless-control:single
+      - name: Test isolated exit DNS caching and private destination denial
+        run: |
+          if ! sudo env PATH="$PATH" .local/ansible-venv/bin/python tests/exit_dns_runtime.py > .local/ci-private/exit-dns-runtime.log 2>&1; then
+            echo "::error::The isolated DNS cache, private destination or transit authentication canary failed."
+            exit 1
+          fi
+          echo 'Five isolated DNS/runtime checks passed: reachable control, transit authentication, cache reuse/TTL expiry, private/mixed-answer denial and unknown-UUID rejection; fixtures removed.' >> "$GITHUB_STEP_SUMMARY"
       - name: Test Ansible idempotence and account continuity
         run: |
           if ! sudo env PATH="$PATH" "$(command -v python)" tests/ansible.py > .local/ci-private/ansible.log 2>&1; then

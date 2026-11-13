@@ -23,6 +23,8 @@ This repository distributes build/deployment instructions and original source. I
 | `containers.podman` Ansible collection | `1.18.0`, controller dependency | [GPL-3.0-or-later declaration](https://github.com/containers/ansible-podman-collections/blob/1.18.0/galaxy.yml) and [license text](https://github.com/containers/ansible-podman-collections/blob/1.18.0/COPYING). Installed separately, not vendored here. |
 | Python test runtime | Official `python:3.13-slim` image used by the HTTP witness | [Python license information](https://docs.python.org/3.13/license.html), plus the independently licensed Debian packages in that image. |
 
+The optional single-client image builds 3x-ui from commit `c621ba9014a6aa21fd7c9ecf45655e44e24ebf13` with repository patches for route selector import, literal subscription labels, account eligibility, and preservation of Vision when a detached client rejoins its first inbound. The changes to 3x-ui are provided under its GPLv3 license. The build recipe verifies the source archive and includes the upstream license in the image. [Matching source](https://github.com/MHSanaei/3x-ui/tree/c621ba9014a6aa21fd7c9ecf45655e44e24ebf13), [local patches](infra/3x-ui/), [build instructions](infra/Dockerfile.control.single).
+
 Versioned links above identify the selected upstream releases where practical. Debian package versions, musl, nginx and image layers must be recorded from the exact built image; the rolling `stable-slim` tag is not a reproducible version identifier.
 
 ## GeoIP and GeoSite assets

@@ -1,0 +1,115 @@
+---
+- name: Create a private directory for this controller backup
+  ansible.builtin.file:
+    path: '{{ controller_state_dir }}/single-client-backups'
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+
+- name: Allocate a unique recovery point
+  ansible.builtin.tempfile:
+    state: directory
+    path: '{{ controller_state_dir }}/single-client-backups'
+    prefix: '{{ now(utc=true, fmt="%Y%m%dT%H%M%SZ") }}-'
+  delegate_to: localhost
+  become: false
+  register: recovery_point
+
+- name: Allocate a private temporary directory on the panel host
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: vless-backup-
+  register: panel_backup_temp
+
+- name: Export a transaction-consistent SQLite snapshot through the authenticated panel
+  block:
+    - name: Get a loopback session and CSRF token
+      ansible.builtin.uri:
+        url: 'http://127.0.0.1:{{ panel_host_port }}/csrf-token'
+        use_proxy: false
+        follow_redirects: none
+      register: csrf
+      failed_when: csrf.status != 200 or not csrf.json.success or not csrf.json.obj
+      no_log: true
+
+    - name: Log in with the deployed controller credential
+      ansible.builtin.uri:
+        url: 'http://127.0.0.1:{{ panel_host_port }}/login'
+        method: POST
+        body_format: json
+        body:
+          username: '{{ panel_username }}'
+          password: "{{ lookup('ansible.builtin.file', controller_state_dir + '/panel-password') }}"
+        headers:
+          Cookie: '{{ csrf.cookies_string }}'
+          X-CSRF-Token: '{{ csrf.json.obj }}'
+        use_proxy: false
+        follow_redirects: none
+      register: logged_in
+      failed_when: logged_in.status != 200 or not logged_in.json.success
+      no_log: true
+
+    - name: Download the running panel's SQLite backup
+      ansible.builtin.uri:
+        url: 'http://127.0.0.1:{{ panel_host_port }}/panel/api/server/getDb'
+        headers:
+          Cookie: "{{ (csrf.cookies | combine(logged_in.cookies)).items() | map('join', '=') | join('; ') }}"
+          X-CSRF-Token: '{{ csrf.json.obj }}'
+        dest: '{{ panel_backup_temp.path }}/x-ui.db'
+        mode: '0600'
+        timeout: 180
+        use_proxy: false
+        follow_redirects: none
+      no_log: true
+
+    - name: Transfer the snapshot to the controller
+      ansible.builtin.fetch:
+        src: '{{ panel_backup_temp.path }}/x-ui.db'
+        dest: '{{ recovery_point.path }}/x-ui.db'
+        flat: true
+        validate_checksum: true
+      no_log: true
+
+    - name: Restrict access to the backup
+      ansible.builtin.file:
+        path: '{{ recovery_point.path }}/x-ui.db'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Verify the transferred backup can be reopened and passes SQLite integrity checks
+      ansible.builtin.command:
+        argv:
+          - '{{ ansible_playbook_python }}'
+          - -c
+          - |
+            import pathlib, sqlite3, sys
+            path = pathlib.Path(sys.argv[1]).resolve()
+            with sqlite3.connect(path.as_uri() + '?mode=ro&immutable=1', uri=True) as db:
+                if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise SystemExit('SQLite backup failed integrity check')
+                for table in ('inbounds', 'clients', 'settings'):
+                    db.execute('SELECT 1 FROM ' + table + ' LIMIT 1').fetchall()
+          - '{{ recovery_point.path }}/x-ui.db'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Report the verified private recovery point
+      ansible.builtin.debug:
+        msg: 'Verified SQLite backup at {{ recovery_point.path }}/x-ui.db'
+  rescue:
+    - name: Discard the incomplete recovery directory
+      ansible.builtin.file:
+        path: '{{ recovery_point.path }}'
+        state: absent
+      delegate_to: localhost
+      become: false
+    - ansible.builtin.fail:
+        msg: Could not export and verify a complete SQLite backup. Migration stopped before upgrading any service.
+  always:
+    - name: Remove the temporary export from the panel host
+      ansible.builtin.file:
+        path: '{{ panel_backup_temp.path }}'
+        state: absent

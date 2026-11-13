@@ -1,3 +1,21 @@
+- name: Check optional gateway name ownership
+  ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/container-ownership.yml'
+  vars:
+    owned_container_name: '{{ deployment_id }}-gateway'
+- name: Verify the prepared control image supports native subscriptions
+  ansible.builtin.command:
+    argv:
+    - '{{ container_engine }}'
+    - image
+    - inspect
+    - --format
+    - '{{ ''{{ index .Config.Labels "io.vless.single-client-subscriptions" }}'' }}'
+    - '{{ control_image }}'
+  environment: '{{ container_cli_environment }}'
+  register: single_control_image
+  changed_when: false
+  failed_when: single_control_image.rc != 0 or single_control_image.stdout | trim != '1'
+  when: panel_client_mode == 'single'
 - name: Deploy control with its persistent database
   ansible.builtin.include_role:
     name: node
@@ -5,7 +23,7 @@
     node_role: control
 - name: Wait for the private admin API
   ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ panel_host_port }}/csrf-token"
+    url: http://127.0.0.1:{{ panel_host_port }}/csrf-token
     status_code: 200
   register: panel_http
   until: panel_http.status == 200
@@ -13,48 +31,70 @@
   delay: 2
 - name: Reconcile directory users and public subscription endpoints
   vless_panel:
-    url: "http://127.0.0.1:{{ panel_host_port }}"
-    username: "{{ panel_username }}"
-    password: "{{ hostvars[groups.headscale[0]].panel_password }}"
-    users: "{{ hostvars[groups.headscale[0]].managed_users }}"
-    ingress_endpoints: "{{ hostvars[groups.headscale[0]].ingress_endpoints }}"
+    url: http://127.0.0.1:{{ panel_host_port }}
+    username: '{{ panel_username }}'
+    password: '{{ hostvars[groups.headscale[0]].panel_password }}'
+    users: '{{ hostvars[groups.headscale[0]].managed_users }}'
+    client_mode: '{{ panel_client_mode }}'
+    migrate_single_clients: '{{ migrate_single_clients }}'
+    route_selectors: '{{ vless_route_selectors }}'
+    exit_countries: "{{ dict(groups.exits | zip(groups.exits | map('extract', hostvars, 'exit_display_country'))) if panel_client_mode == 'single' else {} }}"
+    ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
+    subscription_public_url: '{{ subscription_public_url }}'
   register: panel_directory
   no_log: true
+- name: Verify the single-client subscription eligibility check
+  ansible.builtin.uri:
+    url: 'http://127.0.0.1:{{ subscription_host_port }}/sub/mesh-preflight-{{ 999999999999 | random }}'
+    status_code: 404
+  register: single_feed_check
+  failed_when: single_feed_check.status != 404 or single_feed_check.x_mesh_client_mode | default('') != 'single'
+  when: panel_client_mode == 'single'
 - name: Install subscription TLS credentials
   ansible.builtin.copy:
-    src: "{{ item.src }}"
-    dest: "{{ node_dir }}/secrets/{{ item.dest }}"
+    src: '{{ item.src }}'
+    dest: '{{ node_dir }}/secrets/{{ item.dest }}'
     mode: '0600'
   loop:
-    - {src: "{{ control_tls_cert }}", dest: subscription-cert.pem}
-    - {src: "{{ control_tls_key }}", dest: subscription-key.pem}
+  - src: '{{ control_tls_cert }}'
+    dest: subscription-cert.pem
+  - src: '{{ control_tls_key }}'
+    dest: subscription-key.pem
   register: gateway_certs
   no_log: true
+  when: gateway_enabled | bool
 - name: Discover the container network DNS resolver
   ansible.builtin.command:
-    argv: [podman, network, inspect, "{{ podman_network }}"]
+    argv:
+    - '{{ container_engine }}'
+    - network
+    - inspect
+    - '{{ container_network }}'
   register: gateway_network
   changed_when: false
+  environment: '{{ container_cli_environment }}'
+  when: gateway_enabled | bool and container_engine == 'podman'
 - name: Render the subscription-only HTTPS gateway with dynamic upstream DNS
   ansible.builtin.template:
     src: gateway.conf.j2
-    dest: "{{ node_dir }}/gateway.conf"
+    dest: '{{ node_dir }}/gateway.conf'
     mode: '0600'
   vars:
-    gateway_dns: "{{ (gateway_network.stdout | from_json)[0].subnets[0].gateway }}"
+    gateway_dns: '{{ ''127.0.0.11'' if container_engine == ''docker'' else (gateway_network.stdout | from_json)[0].subnets[0].gateway
+      }}'
   register: gateway_config
-- name: Start the HTTPS subscription gateway
+  when: gateway_enabled | bool
+- name: Start the selected HTTPS gateway runtime
+  ansible.builtin.include_tasks: gateway-{{ container_engine }}.yml
+  when: gateway_enabled | bool
+- name: Remove only the owned Podman gateway when externally terminated
   containers.podman.podman_container:
-    name: "{{ deployment_id }}-gateway"
-    image: "{{ gateway_image }}"
-    state: started
-    restart_policy: always
-    recreate: "{{ gateway_config.changed or gateway_certs.changed }}"
-    network: "{{ podman_network }}"
-    publish: "{{ gateway_publish }}"
-    security_opt: [label=disable, no-new-privileges]
-    volume:
-      - "{{ (node_dir | realpath) + '/gateway.conf:/etc/nginx/conf.d/subscription.conf:ro' }}"
-      - "{{ (node_dir | realpath) + '/secrets/subscription-cert.pem:/etc/nginx/cert.pem:ro' }}"
-      - "{{ (node_dir | realpath) + '/secrets/subscription-key.pem:/etc/nginx/key.pem:ro' }}"
-    label: {io.vless.deployment: "{{ deployment_id }}"}
+    name: '{{ deployment_id }}-gateway'
+    state: absent
+  when: not gateway_enabled | bool and container_engine == 'podman'
+- name: Remove only the owned Docker gateway when externally terminated
+  community.docker.docker_container:
+    name: '{{ deployment_id }}-gateway'
+    docker_host: '{{ docker_host }}'
+    state: absent
+  when: not gateway_enabled | bool and container_engine == 'docker'

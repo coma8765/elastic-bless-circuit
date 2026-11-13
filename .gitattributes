@@ -3,3 +3,5 @@
 *.jpg binary
 *.gif binary
 *.ico binary
+# Unified diffs contain a leading space on context lines, including empty lines.
+infra/3x-ui/*.patch whitespace=-blank-at-eol,-space-before-tab

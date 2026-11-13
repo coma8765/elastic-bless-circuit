@@ -1,0 +1,31 @@
+- name: Start the Docker HTTPS subscription gateway
+  community.docker.docker_container:
+    name: '{{ deployment_id }}-gateway'
+    image: '{{ gateway_image }}'
+    docker_host: '{{ docker_host }}'
+    state: started
+    restart_policy: always
+    recreate: '{{ gateway_config.changed or gateway_certs.changed }}'
+    pull: never
+    container_default_behavior: no_defaults
+    network_mode: '{{ container_network }}'
+    networks:
+    - name: '{{ container_network }}'
+    published_ports: '{{ gateway_publish }}'
+    security_opts:
+    - no-new-privileges:true
+    volumes:
+    - '{{ (node_dir | realpath) + ''/gateway.conf:/etc/nginx/conf.d/subscription.conf:ro'' }}'
+    - '{{ (node_dir | realpath) + ''/secrets/subscription-cert.pem:/etc/nginx/cert.pem:ro'' }}'
+    - '{{ (node_dir | realpath) + ''/secrets/subscription-key.pem:/etc/nginx/key.pem:ro'' }}'
+    labels:
+      io.vless.deployment: '{{ deployment_id }}'
+    comparisons:
+      networks: strict
+      # Docker defaults to keeping extra published ports; removals must close them.
+      published_ports: strict
+      dns_servers: strict
+      etc_hosts: strict
+      labels: allow_more_present
+    dns_servers: '{{ container_dns_servers }}'
+    etc_hosts: '{{ container_extra_hosts }}'

@@ -1,0 +1,50 @@
+--- a/internal/database/model/model.go
++++ b/internal/database/model/model.go
+@@ -1170,6 +1170,9 @@
+ 
+ func (InboundFallback) TableName() string { return "inbound_fallbacks" }
+ 
++// HostTagLiteralRemark preserves an explicitly final route label through Host import.
++const HostTagLiteralRemark = "vless-mesh:literal-route-remark"
++
+ type Host struct {
+ 	Id                int      `json:"id" form:"id" gorm:"primaryKey;autoIncrement" example:"1"`
+ 	GroupId           string   `json:"groupId" form:"groupId" gorm:"column:group_id;index"`
+--- a/internal/database/db.go
++++ b/internal/database/db.go
+@@ -1009,7 +1009,14 @@
+ 	sni, _ := ep["sni"].(string)
+ 	fingerprint, _ := ep["fingerprint"].(string)
+ 	ech, _ := ep["echConfigList"].(string)
++	route, _ := ep["vlessRoute"].(string)
++	var tags []string
++	if final, _ := ep["remarkFinal"].(bool); final && route != "" {
++		tags = []string{model.HostTagLiteralRemark}
++	}
+ 	return &model.Host{
++		VlessRoute:           route,
++		Tags:                 tags,
+ 		GroupId:              random.NumLower(16),
+ 		InboundId:            inboundId,
+ 		SortOrder:            index,
+--- a/internal/sub/host_sub.go
++++ b/internal/sub/host_sub.go
+@@ -287,6 +287,9 @@
+ 	}
+ 	if h.VlessRoute != "" {
+ 		ep["vlessRoute"] = h.VlessRoute
++		if slices.Contains(h.Tags, model.HostTagLiteralRemark) {
++			ep["remarkFinal"] = true
++		}
+ 	}
+ 	if h.ServerDescription != "" {
+ 		ep["serverDescription"] = h.ServerDescription
+@@ -425,7 +428,7 @@
+ // No-op for non-host endpoints (legacy externalProxy / synthetic default), so
+ // their output stays byte-identical.
+ func (s *SubService) renderHostRemark(inbound *model.Inbound, client model.Client, ep map[string]any, transport string) {
+-	if !isHostEndpoint(ep) {
++	if final, _ := ep["remarkFinal"].(bool); final || !isHostEndpoint(ep) {
+ 		return
+ 	}
+ 	tmpl, _ := ep["remark"].(string)

@@ -1,31 +1,32 @@
 - name: Inspect persisted enrollment key
   ansible.builtin.stat:
-    path: "{{ controller_state_dir }}/enrollment/{{ mesh_node }}.key"
+    path: '{{ controller_state_dir }}/enrollment/{{ mesh_node }}.key'
   register: saved_key
   delegate_to: localhost
   become: false
 - name: Create a single-use enrollment key for the node tag
   ansible.builtin.command:
     argv:
-      - podman
-      - exec
-      - "{{ container_name }}"
-      - headscale
-      - preauthkeys
-      - create
-      - --tags
-      - "tag:{{ 'control' if mesh_node in groups.control else ('out' if mesh_node in groups.exits else 'in') }}"
-      - --expiration
-      - 24h
-      - -o
-      - json
+    - '{{ container_engine }}'
+    - exec
+    - '{{ container_name }}'
+    - headscale
+    - preauthkeys
+    - create
+    - --tags
+    - tag:{{ 'control' if mesh_node in groups.control else ('out' if mesh_node in groups.exits else 'in') }}
+    - --expiration
+    - 24h
+    - -o
+    - json
   when: not saved_key.stat.exists
   register: created_key
   no_log: true
+  environment: '{{ container_cli_environment }}'
 - name: Save the enrollment key privately on the controller
   ansible.builtin.copy:
-    content: "{{ (created_key.stdout | from_json).key }}"
-    dest: "{{ controller_state_dir }}/enrollment/{{ mesh_node }}.key"
+    content: '{{ (created_key.stdout | from_json).key }}'
+    dest: '{{ controller_state_dir }}/enrollment/{{ mesh_node }}.key'
     mode: '0600'
   when: not saved_key.stat.exists
   delegate_to: localhost

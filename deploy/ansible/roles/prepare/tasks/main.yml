@@ -1,56 +1,193 @@
-- name: Require Debian on managed production hosts
+- name: Validate the selected runtime and managed host
   ansible.builtin.assert:
     that:
-      - local_mode | bool or ansible_facts.distribution == 'Debian'
-      - local_mode | bool or ansible_facts.user_id == 'root'
-    fail_msg: "Production uses rootful Podman on Debian; run with --become."
-- name: Install the Debian container runtime
+    - container_engine in ['podman', 'docker']
+    - local_mode | bool or ansible_facts.os_family == 'Debian'
+    - local_mode | bool or ansible_facts.user_id == 'root'
+    fail_msg: Use rootful Docker or Podman on Debian/Ubuntu; run production deployment with --become.
+- name: Detect an already installed runtime without changing it
+  ansible.builtin.command:
+    argv:
+    - '{{ container_engine }}'
+    - --version
+  register: installed_runtime
+  changed_when: false
+  failed_when: false
+- name: Install Debian-family deployment dependencies
   ansible.builtin.apt:
-    name: [podman, python3, ca-certificates, tar]
+    name: '{{ [''python3'', ''ca-certificates'', ''tar''] + ([''python3-requests''] if container_engine == ''docker'' else
+      []) }}'
     state: present
     update_cache: true
     cache_valid_time: 3600
   when: install_packages | bool
-- name: Restore managed containers after host reboot
+- name: Install the selected runtime only when its CLI is absent
+  ansible.builtin.apt:
+    name: '{{ ''docker.io'' if container_engine == ''docker'' else ''podman'' }}'
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: install_packages | bool and installed_runtime.rc != 0
+- name: Enable the existing Docker daemon without replacing its packages
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+  when: not local_mode | bool and container_engine == 'docker'
+- name: Restore managed Podman containers after host reboot
   ansible.builtin.systemd_service:
     name: podman-restart.service
     enabled: true
-  when: not local_mode | bool
+  when: not local_mode | bool and container_engine == 'podman'
+- name: Read the runtime version and verify daemon access
+  ansible.builtin.command:
+    argv:
+    - '{{ container_engine }}'
+    - version
+    - --format
+    - '{{ ''{{.Server.Version}}'' if container_engine == ''docker'' else ''{{.Client.Version}}'' }}'
+  environment: '{{ container_cli_environment }}'
+  register: runtime_version
+  changed_when: false
+- name: Require a supported runtime version
+  ansible.builtin.assert:
+    that:
+    - runtime_version.stdout | trim is version(docker_minimum_version if container_engine == 'docker' else podman_minimum_version,
+      '>=')
+    fail_msg: The selected container runtime is older than the supported minimum.
+- name: Verify Docker is a rootful local daemon
+  ansible.builtin.command:
+    argv:
+    - docker
+    - info
+    - --format
+    - '{{ ''{{json .SecurityOptions}}'' }}'
+  environment: '{{ container_cli_environment }}'
+  register: docker_security
+  changed_when: false
+  when: container_engine == 'docker'
+- name: Reject unsupported rootless Docker networking
+  ansible.builtin.assert:
+    that:
+    - '''rootless'' not in docker_security.stdout'
+    fail_msg: Mesh containers require the rootful Docker daemon and /dev/net/tun.
+  when: container_engine == 'docker'
+- name: Verify the target Python can use the Docker API
+  ansible.builtin.command:
+    argv:
+    - '{{ ansible_facts.python.executable }}'
+    - -c
+    - import requests
+  changed_when: false
+  when: container_engine == 'docker'
+- name: Check ownership before changing this service
+  ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/container-ownership.yml'
+  vars:
+    owned_container_name: '{{ container_name }}'
+- name: Inspect an existing Docker bridge ownership label
+  ansible.builtin.command:
+    argv:
+    - docker
+    - network
+    - inspect
+    - --format
+    - '{{ ''{{ index .Labels "io.vless.deployment" }}'' }}'
+    - '{{ container_network }}'
+  environment: '{{ container_cli_environment }}'
+  register: docker_bridge_owner
+  changed_when: false
+  failed_when: false
+  when: container_engine == 'docker'
+- name: Refuse to adopt an unrelated Docker bridge
+  ansible.builtin.assert:
+    that:
+    - docker_bridge_owner.rc != 0 or docker_bridge_owner.stdout | trim == deployment_id
+    fail_msg: The requested Docker network belongs to another service; choose another container_network.
+  when: container_engine == 'docker'
 - name: Create private runtime and build directories
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: '{{ item }}'
     state: directory
     mode: '0700'
-  loop: ["{{ node_dir }}", "{{ node_dir }}/secrets", "{{ deployment_root }}/build"]
+  loop:
+  - '{{ node_dir }}'
+  - '{{ node_dir }}/secrets'
+  # Logical roles may share one physical host; each must retain its own copy
+  # change signal so an earlier role cannot consume another role's upgrade.
+  - '{{ deployment_root }}/build/{{ inventory_hostname }}'
+- name: Select only the images required by this logical service
+  ansible.builtin.set_fact:
+    runtime_image_targets: '{{ ([''headscale''] if inventory_hostname in groups.headscale else ([''control''] + ([''gateway'']
+      if gateway_enabled | bool else []) if inventory_hostname in groups.control else [''node''])) if prepare_images_by_role
+      | bool else [''node'', ''control'', ''headscale'', ''gateway''] }}'
+    runtime_required_images: '{{ ([headscale_image] if inventory_hostname in groups.headscale else ([control_image] + ([gateway_image]
+      if gateway_enabled | bool else []) if inventory_hostname in groups.control else [node_image])) if prepare_images_by_role
+      | bool else [node_image, control_image, headscale_image, gateway_image] }}'
 - name: Copy build inputs without credentials or local artifacts
   ansible.builtin.copy:
-    src: "{{ repo_root }}/{{ item }}"
-    dest: "{{ deployment_root }}/build/"
+    src: '{{ repo_root }}/{{ item }}'
+    dest: '{{ deployment_root }}/build/{{ inventory_hostname }}/'
     mode: preserve
-  loop: [CMakeLists.txt, src, infra, scripts]
+  loop:
+  - CMakeLists.txt
+  - src
+  - infra
+  - scripts
   register: build_sources
   when: build_images | bool
-- name: Inspect required images
+- name: Inspect only the required images
   ansible.builtin.command:
-    argv: [podman, image, exists, "{{ item }}"]
-  loop: "{{ [node_image, control_image, headscale_image, gateway_image] }}"
+    argv:
+    - '{{ container_engine }}'
+    - image
+    - inspect
+    - --format
+    - '{{ ''{{.Id}}'' }}'
+    - '{{ item }}'
+  environment: '{{ container_cli_environment }}'
+  loop: '{{ runtime_required_images }}'
   register: existing_images
   changed_when: false
   failed_when: false
-- name: Build all deployment images on the target architecture
+- name: Build the required deployment images on the target architecture
   ansible.builtin.command:
-    argv: [sh, "{{ deployment_root }}/build/scripts/build.sh"]
+    argv:
+    - sh
+    - '{{ deployment_root }}/build/{{ inventory_hostname }}/scripts/build.sh'
+  environment: '{{ container_cli_environment | combine({''CONTAINER_ENGINE'': container_engine, ''PANEL_CLIENT_MODE'': panel_client_mode | default(''grouped''), ''BUILD_IMAGES'': runtime_image_targets
+    | join('' '')}) }}'
   when:
-    - build_images | bool
-    - build_sources.changed or (existing_images.results | selectattr('rc', 'ne', 0) | list | length > 0)
-- name: Pull configured images when builds are disabled
+  - build_images | bool
+  - build_sources.changed or (existing_images.results | selectattr('rc', 'ne', 0) | list | length > 0)
+- name: Pull missing configured Podman images when builds are disabled
   containers.podman.podman_image:
-    name: "{{ item.item }}"
+    name: '{{ item.item }}'
     state: present
-  loop: "{{ existing_images.results }}"
-  loop_control: {label: "{{ item.item }}"}
-  when: not build_images | bool and item.rc != 0
-- name: Create the deployment bridge
+  loop: '{{ existing_images.results }}'
+  loop_control:
+    label: '{{ item.item }}'
+  when: container_engine == 'podman' and not build_images | bool and item.rc != 0
+- name: Pull missing configured Docker images when builds are disabled
+  community.docker.docker_image_pull:
+    name: '{{ item.item }}'
+    pull: not_present
+    docker_host: '{{ docker_host }}'
+  loop: '{{ existing_images.results }}'
+  loop_control:
+    label: '{{ item.item }}'
+  when: container_engine == 'docker' and not build_images | bool and item.rc != 0
+- name: Create the Podman deployment bridge
   containers.podman.podman_network:
-    name: "{{ podman_network }}"
+    name: '{{ container_network }}'
     state: present
+  when: container_engine == 'podman'
+- name: Create the Docker deployment bridge
+  community.docker.docker_network:
+    name: '{{ container_network }}'
+    docker_host: '{{ docker_host }}'
+    driver: bridge
+    state: present
+    appends: true
+    labels:
+      io.vless.deployment: '{{ deployment_id }}'
+  when: container_engine == 'docker'

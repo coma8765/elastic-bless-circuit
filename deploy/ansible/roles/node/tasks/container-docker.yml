@@ -1,0 +1,55 @@
+- name: Start the supervised Docker mesh service
+  community.docker.docker_container:
+    name: '{{ container_name }}'
+    image: '{{ control_image if node_role == ''control'' else node_image }}'
+    docker_host: '{{ docker_host }}'
+    state: started
+    restart_policy: always
+    memory: "{{ node_memory | default(omit) }}"
+    memory_swap: "{{ node_memory_swap | default(omit) }}"
+    pids_limit: "{{ node_pids_limit | default(omit) }}"
+    recreate: '{{ node_config.changed or mesh_secret.changed or mesh_ca.changed or panel_secrets.changed or transit_secret.changed
+      or ingress_transit.changed or ingress_certs.changed or ingress_reality.changed }}'
+    pull: never
+    container_default_behavior: no_defaults
+    network_mode: '{{ container_network }}'
+    networks:
+    - name: '{{ container_network }}'
+    published_ports: '{{ mesh_udp_publish + ([''127.0.0.1:'' + (panel_host_port | string) + '':2053/tcp'', ''127.0.0.1:''
+      + (subscription_host_port | string) + '':2096/tcp''] if node_role == ''control'' else (ingress_publish if node_role
+      == ''in'' else [])) }}'
+    security_opts:
+    - no-new-privileges:true
+    volumes: '{{ [ (node_dir | realpath) + ''/config.yaml:/etc/node/config.yaml:ro'', (node_dir | realpath) + ''/secrets:/run/secrets:ro'',
+      container_name + ''-state:/var/lib/tailscale'', container_name + ''-cache:/var/lib/node''] + ([container_name + ''-db:/etc/x-ui'']
+      if node_role == ''control'' else []) }}'
+    labels:
+      io.vless.deployment: '{{ deployment_id }}'
+    comparisons:
+      networks: strict
+      # Docker defaults to keeping extra published ports; removals must close them.
+      published_ports: strict
+      dns_servers: strict
+      etc_hosts: strict
+      labels: allow_more_present
+    cap_drop:
+    - ALL
+    capabilities:
+    - NET_ADMIN
+    - NET_RAW
+    - NET_BIND_SERVICE
+    - SETUID
+    - SETGID
+    - CHOWN
+    - DAC_OVERRIDE
+    devices:
+    - /dev/net/tun:/dev/net/tun:rwm
+    read_only: '{{ node_role != ''control'' }}'
+    tmpfs:
+    - /run:rw,nosuid,nodev
+    - /tmp:rw,nosuid,nodev
+    env: '{{ {''SSL_CERT_FILE'': ''/run/secrets/headscale-ca.pem''} if headscale_ca_file | length > 0 else {} }}'
+    stop_timeout: 20
+    dns_servers: '{{ container_dns_servers }}'
+    etc_hosts: '{{ container_extra_hosts }}'
+  register: node_container
