@@ -44,6 +44,6 @@
   environment: '{{ container_cli_environment }}'
 - name: Provision independent node enrollment credentials
   ansible.builtin.include_tasks: enrollment.yml
-  loop: '{{ groups.control + groups.exits + groups.ingress }}'
+  loop: "{{ groups.control + groups.exits + groups.ingress + groups.get('route_gateways', []) }}"
   loop_control:
     loop_var: mesh_node

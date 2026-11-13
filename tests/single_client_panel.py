@@ -152,6 +152,39 @@ class SingleClient(unittest.TestCase):
         self.assertFalse(self.apply())
         self.assertNotIn('alice', self.api.clients)
 
+    def test_auto_is_opt_in_and_published_only_after_gateway_is_ready(self):
+        self.params['migrate_single_clients'] = True
+        self.apply()
+        self.params.update(migrate_single_clients=False, defer_new_auto=True)
+        endpoint = self.params['ingress_endpoints'][0]
+        endpoint['auto_selector'] = 16420
+        endpoint['aliases'] = [dict(address='alias.example.test', port=8443, remark='alias',
+                                    display_country='Alias')]
+        self.apply()
+        def auto_profiles():
+            return [(p['dest'], p['remark'], p['vlessRoute']) for ib in self.api.inbounds
+                    for p in ib['streamSettings']['externalProxy'] if p['remark'].endswith(' -> Auto')]
+        self.assertEqual(auto_profiles(), [])
+        self.params['defer_new_auto'] = False
+        self.assertTrue(self.apply())
+        self.assertEqual(auto_profiles(), [('in.example.test', 'Russia -> Auto', '16420'),
+                                          ('alias.example.test', 'Alias -> Auto', '16420')])
+        self.params['defer_new_auto'] = True
+        self.assertFalse(self.apply())
+        del endpoint['auto_selector']
+        self.assertTrue(self.apply())
+        self.assertEqual(auto_profiles(), [])
+
+    def test_auto_selector_validation(self):
+        for auto in [True, 16383, 20480, 16385, '16420']:
+            with self.subTest(auto=auto), self.assertRaises(panel.PanelError):
+                self.params['ingress_endpoints'][0]['auto_selector'] = auto
+                panel.validate(self.params)
+        self.params['ingress_endpoints'][0]['auto_selector'] = 16420
+        self.params['exit_countries']['west'] = 'Auto'
+        with self.assertRaises(panel.PanelError):
+            panel.validate(self.params)
+
     def test_fresh_install_leaves_client_creation_to_panel(self):
         self.api.clients = {}
         self.api.inbounds = []

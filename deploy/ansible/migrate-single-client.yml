@@ -9,13 +9,14 @@
       ansible.builtin.assert:
         that:
           - not ansible_check_mode
+          - groups.get('route_gateways', []) | length == 0
           - panel_client_mode == 'single'
           - migrate_single_clients | bool
           - single_client_migration_phase | default('stage') in ['stage', 'cutover']
           - (groups.headscale + groups.control + groups.exits + groups.ingress) | difference(ansible_play_hosts_all) | length == 0
           - groups.headscale | length == 1 and groups.control | length == 1
           - groups.ingress | length > 0 and groups.exits | length > 0
-        fail_msg: Use the full existing inventory, panel_client_mode=single and migrate_single_clients=true. Stage is the default phase.
+        fail_msg: Use the full existing inventory, panel_client_mode=single and migrate_single_clients=true. Stage is the default phase. Deploy route gateways with site.yml after the grouped migration.
 
 - name: Back up the live control database before changing deployment state
   hosts: control

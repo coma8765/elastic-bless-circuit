@@ -14,7 +14,7 @@
     - preauthkeys
     - create
     - --tags
-    - tag:{{ 'control' if mesh_node in groups.control else ('out' if mesh_node in groups.exits else 'in') }}
+    - tag:{{ 'control' if mesh_node in groups.control else ('out' if mesh_node in groups.exits else ('route-gateway' if mesh_node in groups.get('route_gateways', []) else 'in')) }}
     - --expiration
     - 24h
     - -o

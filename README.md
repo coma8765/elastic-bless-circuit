@@ -66,6 +66,8 @@ Each eligible exit has a stable numeric selector in the YAML inventory. 3x-ui em
 
 Use `PANEL_CLIENT_MODE=single ./scripts/build.sh` for the single-client control image. For a new single-mode installation, use REALITY on all ingresses, set country display names, supply a distinct `vless_route_selectors` value from 16384 through 20479 for each exit, and leave `vless_users: []`. Create users in the panel after deployment. Existing grouped installations require the [rolling migration and recovery procedure](docs/single-client-migration.md).
 
+A mesh-only route gateway can add a `country -> Auto` choice to selected subscriptions. It filters exits by destination country and ingress permissions, then selects the healthy exit with the lowest measured latency. [Configuration and local test](deploy/ansible/README.md#geoip-gateway-and-the-auto-profile).
+
 ## Production configuration
 
 For REALITY with `xtls-rprx-vision`, use [config/in-reality.yaml](config/in-reality.yaml) and the [REALITY configuration guide](docs/reality.md). The existing TLS profile remains supported.

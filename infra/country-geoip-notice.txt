@@ -1,0 +1,7 @@
+country-geoip.dat is the unmodified v2fly/geoip country dataset, release 202611080027.
+Source: https://github.com/v2fly/geoip/releases/tag/202611080027
+Project license: Creative Commons Attribution-ShareAlike 4.0 International
+https://creativecommons.org/licenses/by-sa/4.0/
+IP geolocation data by DB-IP: https://db-ip.com
+DB-IP data license: Creative Commons Attribution 4.0 International
+https://creativecommons.org/licenses/by/4.0/
