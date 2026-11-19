@@ -1,0 +1,15 @@
+- name: Reconcile directory users and public subscription endpoints
+  vless_panel:
+    url: http://127.0.0.1:{{ panel_host_port }}
+    username: '{{ panel_username }}'
+    password: '{{ hostvars[groups.headscale[0]].panel_password }}'
+    users: '{{ hostvars[groups.headscale[0]].managed_users }}'
+    client_mode: '{{ panel_client_mode }}'
+    migrate_single_clients: '{{ migrate_single_clients }}'
+    defer_new_auto: '{{ defer_new_auto | default(false) }}'
+    route_selectors: '{{ vless_route_selectors }}'
+    exit_countries: "{{ dict(groups.exits | zip(groups.exits | map('extract', hostvars, 'exit_display_country'))) if panel_client_mode == 'single' else {} }}"
+    ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
+    subscription_public_url: '{{ subscription_public_url }}'
+  register: panel_directory
+  no_log: true

@@ -39,6 +39,45 @@ python3 tests/ansible.py down
 
 `verify` checks the currently deployed base or expanded stand. `down` removes only the containers, volumes and network recorded in the Ansible test manifest. Controller user credentials remain available for reuse. See enrollment recovery below when replacing state volumes or the Headscale database.
 
+## GeoIP gateway and the Auto profile
+
+An optional `route_gateways` host forwards traffic from a REALITY ingress to an eligible exit over the Headscale mesh. A client selecting **Auto** keeps its existing subscription URL. For each new connection, the gateway matches the destination IP's country, intersects the configured exit pool with the authenticated ingress's exit allowlist, and uses Xray's most recent healthy HTTPS probe with the lowest latency. A hostname on the Auto path is resolved at ingress and the selected IP is forwarded to the gateway. Private destinations, unmatched countries, and pools with no healthy eligible exit are blocked. Existing connections may need to reconnect after an exit fails.
+
+Add the following entries under `all.children.vless` in an existing single-client REALITY inventory. This example assumes `in-eu`, `out-de`, and `out-fr` already exist with their manual routes, stable selectors and country labels. Choose an Auto selector in 16384–20479 distinct from manual selectors and previously issued primary credentials. Use the same value on subsequent runs.
+
+```yaml
+children:
+  route_gateways:
+    hosts:
+      router-eu:
+        ansible_host: 192.0.2.40
+        transit_port: 8443
+        route_gateway_countries:
+          DE: [out-de, out-fr]
+          FR: [out-fr]
+        route_gateway_probe_url: https://www.gstatic.com/generate_204
+        route_gateway_probe_interval_seconds: 30
+  ingress:
+    hosts:
+      in-eu:
+        ingress_route_gateway: router-eu
+        ingress_auto_selector: 20470
+        ingress_subscription_exits: [out-de, out-fr]
+```
+
+Run `./scripts/ansible.sh -i /path/to/inventory.yml --become deploy/ansible/site.yml` with the full inventory. If using prebuilt images, supply the gateway-capable node image on the routing host and its participating ingresses. The playbook creates a separate transit credential for each ingress/gateway pair, enrolls the gateway, stages the readers, then publishes the new `country -> Auto` choice. The gateway listens for transit TCP on its mesh address. The existing subscription nginx continues to serve its own separate role.
+
+The interval controls how often Xray checks a common HTTPS endpoint through every configured exit. Choose an endpoint reachable from those exits. Selection reflects the last completed probes. A zero-healthy pool blocks new connections until observations recover. The gateway image includes a checksum-pinned full country database, with configured codes validated by `xray run -test` at startup. [Xray routing](https://xtls.github.io/en/config/routing.html#balancerobject), [Observatory](https://xtls.github.io/en/config/observatory.html), [data attribution](../../infra/country-geoip-notice.txt).
+
+To withdraw Auto, remove both ingress gateway settings. Once no ingress references a gateway, also remove it from `route_gateways` and rerun the playbook. Stop the retired node's owned container on its host. Grouped deployments can use the [single-client migration](../../docs/single-client-migration.md) before adding gateways.
+
+To run the offline wire test after building the node image:
+
+```sh
+podman pull docker.io/library/python:3.13-slim
+python3 tests/geoip_gateway.py --image localhost/vless-node:dev
+```
+
 ## Deploy to Debian or Ubuntu over SSH
 
 Copy `inventory.example.yml` to a separate inventory, replace the documentation IP addresses with reachable Debian or Ubuntu hosts, configure SSH access and set the real public Headscale/ingress DNS names. Keep the example `vless` child group and place shared overrides there; host-specific values belong on each inventory host. The `deployment_defaults` role supplies lower-priority defaults and resolves them before provisioning.

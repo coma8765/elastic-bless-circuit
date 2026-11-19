@@ -55,6 +55,13 @@ ingress_advertised_aliases: []
 ingress_advertised: true
 # Empty advertises every user exit; nonempty requires country display labels.
 ingress_subscription_exits: []
+# Optional single-client Auto route. Use a stable unused UUID selector on opted-in ingresses.
+ingress_route_gateway: ""
+ingress_auto_selector: null
+# On route_gateways, map destination country codes to permitted exit inventory names.
+route_gateway_countries: {}
+route_gateway_probe_url: https://www.gstatic.com/generate_204
+route_gateway_probe_interval_seconds: 30
 ingress_display_country: ""
 exit_display_country: ""
 ingress_publish: ["443:443/tcp"]

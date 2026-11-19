@@ -483,8 +483,11 @@ struct SingleRoutes {
   std::map<std::string, std::string> reserved; // normalized -> exact UUID
 };
 
+static constexpr char auto_gateway_tag[] = "auto-gateway";
+
 static SingleRoutes single_routes(const YAML::Node &config,
-                                  const std::set<std::string> &exits) {
+                                  const std::set<std::string> &exits,
+                                  const YAML::Node &auto_gateway) {
   SingleRoutes plan;
   const auto selectors = config["selectors"];
   if (!config.IsMap() || !selectors.IsMap() || !selectors.size())
@@ -496,6 +499,12 @@ static SingleRoutes single_routes(const YAML::Node &config,
         !exits.count(exit) || !plan.eligible_exits.insert(exit).second ||
         !plan.selectors.emplace(value.get<int>(), exit).second)
       throw std::runtime_error("invalid or duplicate single_client selector");
+  }
+  if (auto_gateway.IsDefined()) {
+    const auto value = jsonyaml(auto_gateway["selector"]);
+    if (!value.is_number_integer() || value < 0x4000 || value > 0x4fff ||
+        !plan.selectors.emplace(value.get<int>(), auto_gateway_tag).second)
+      throw std::runtime_error("Auto needs a distinct UUID-v4 route selector");
   }
   const auto legacy = config["legacy"];
   if (!legacy.IsDefined())
@@ -538,8 +547,9 @@ static SingleRoutes single_routes(const YAML::Node &config,
 
 static void single_clients(const YAML::Node &config, const J &users,
                            const J &stream, const std::set<std::string> &exits,
-                           J &clients, J &rules) {
-  const auto plan = single_routes(config, exits);
+                           J &clients, J &rules,
+                           const YAML::Node &auto_gateway) {
+  const auto plan = single_routes(config, exits, auto_gateway);
   std::map<std::string, J> rows;
   std::set<std::string> quarantined;
   // Include inactive rows for collision checks. A malformed account must not
@@ -607,10 +617,162 @@ static void single_clients(const YAML::Node &config, const J &users,
   }
 }
 
+// Mesh peers share one pinned-address transport implementation for both
+// manual exits and gateway forwarding.
+static void add_transit(const YAML::Node &c, J &root, const std::string &tag,
+                        const YAML::Node &e, size_t index) {
+  if (!c["allow_insecure_lab"].as<bool>(false) &&
+      !mesh_ipv4(e["address"].as<std::string>()))
+    throw std::runtime_error("transit exit must use a mesh IPv4 address");
+  auto id = secret(e["uuid_file"]);
+  uuid(id);
+  auto transit_address = e["address"].as<std::string>();
+  in_addr transit_ip{};
+  const bool mesh_transit = mesh_ipv4(transit_address) && c["mesh"] &&
+                            c["mesh"]["enabled"].as<bool>(true);
+  if (inet_pton(AF_INET, transit_address.c_str(), &transit_ip) == 1) {
+    // Xray rejects plaintext VLESS to CGNAT literals, even when WireGuard
+    // already encrypts the transport. Resolve a private synthetic name
+    // exclusively through this pinned hosts entry; no external DNS lookup.
+    const auto domain = "transit-" + std::to_string(index) + ".mesh.invalid";
+    root["dns"]["hosts"][domain] = transit_address;
+    transit_address = domain;
+  }
+  root["outbounds"].push_back(
+      {{"tag", tag},
+       {"protocol", "vless"},
+       {"settings",
+        {{"vnext",
+          J::array({{{"address", transit_address},
+                     {"port", port(e["port"])},
+                     {"users",
+                      J::array({{{"id", id}, {"encryption", "none"}}})}}})}}},
+       {"streamSettings",
+        {{"network", "tcp"},
+         {"security", "none"},
+         {"sockopt", {{"domainStrategy", "UseIPv4"}}}}}});
+  if (mesh_transit)
+    root["outbounds"].back()["streamSettings"]["sockopt"]["interface"] =
+        "tailscale0";
+}
+
+static std::set<std::string>
+gateway_exit_set(const YAML::Node &list,
+                 const std::map<std::string, std::string> &tags) {
+  if (!list.IsSequence() || list.size() == 0)
+    throw std::runtime_error("gateway exit pools must be nonempty lists");
+  std::set<std::string> exits;
+  for (auto item : list) {
+    auto name = item.as<std::string>();
+    if (!tags.count(name) || !exits.insert(name).second)
+      throw std::runtime_error("unknown or duplicated gateway pool exit");
+  }
+  return exits;
+}
+
+static void add_gateway(const YAML::Node &c, J &root,
+                        const std::map<std::string, std::string> &tags,
+                        J &clients, J &rules) {
+  auto config = c["gateway"];
+  auto countries = config["countries"];
+  auto ingresses = config["ingresses"];
+  if (!countries.IsMap() || countries.size() == 0 || !ingresses.IsSequence() ||
+      ingresses.size() == 0)
+    throw std::runtime_error(
+        "gateway requires country pools and allowed ingresses");
+  auto url = config["probe_url"].as<std::string>();
+  const bool lab = c["allow_insecure_lab"].as<bool>(false);
+  // Xray assumes its probe URL parses as an HTTP request. Reject malformed
+  // escapes and authorities before handing the URL to the observatory.
+  std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsed(curl_url(),
+                                                             curl_url_cleanup);
+  if (!(url.starts_with("https://") || (lab && url.starts_with("http://"))) ||
+      !parsed ||
+      curl_url_set(parsed.get(), CURLUPART_URL, url.c_str(),
+                   CURLU_DISALLOW_USER) != CURLUE_OK ||
+      url.find_first_of("#\\") != std::string::npos ||
+      std::regex_search(url, std::regex(R"(\s|%(?![0-9a-fA-F]{2}))")))
+    throw std::runtime_error("gateway probe must be an absolute HTTPS URL");
+  const auto interval = config["probe_interval_seconds"].as<int>(30);
+  if (interval < 1 || interval > 3600)
+    throw std::runtime_error(
+        "gateway probe_interval_seconds must be in 1..3600");
+
+  std::map<std::string, std::set<std::string>> pools;
+  for (auto row : countries) {
+    auto code = row.first.as<std::string>();
+    if (!std::regex_match(code, std::regex("[a-zA-Z]{2}")))
+      throw std::runtime_error(
+          "gateway country needs a two-letter country code");
+    std::transform(code.begin(), code.end(), code.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (!pools.emplace(code, gateway_exit_set(row.second, tags)).second)
+      throw std::runtime_error("duplicate gateway country");
+  }
+  rules.push_back({{"type", "field"},
+                   {"ip", J::array({"geoip:private"})},
+                   {"outboundTag", "block"}});
+  std::map<std::vector<std::string>, std::string> balancer_tags;
+  auto &balancers = root["routing"]["balancers"] = J::array();
+  std::set<std::string> names, ids, routed_countries;
+  for (auto peer : ingresses) {
+    const auto name = peer["name"].as<std::string>();
+    const auto id = canonical_uuid(secret(peer["uuid_file"]));
+    if (name.empty() || !names.insert(name).second ||
+        !ids.insert(vless_identity(id)).second)
+      throw std::runtime_error("duplicate or invalid gateway ingress identity");
+    const auto label = "gateway-ingress-" + std::to_string(clients.size());
+    clients.push_back({{"id", id}, {"email", label}});
+    auto allowed = gateway_exit_set(peer["exits"], tags);
+    for (const auto &[code, exits] : pools) {
+      std::vector<std::string> eligible;
+      for (const auto &exit : exits)
+        if (allowed.count(exit))
+          eligible.push_back(tags.at(exit));
+      if (eligible.empty())
+        continue;
+      // Selectors match prefixes in Xray. Internal tags have a terminating
+      // slash so that tag 1 cannot accidentally include tags 10 or 11.
+      const auto [it, created] = balancer_tags.emplace(
+          eligible, "gateway-pool-" + std::to_string(balancer_tags.size()));
+      if (created)
+        balancers.push_back({{"tag", it->second},
+                             {"selector", eligible},
+                             {"strategy", {{"type", "leastPing"}}},
+                             {"fallbackTag", "block"}});
+      routed_countries.insert(code);
+      rules.push_back({{"type", "field"},
+                       {"user", J::array({label})},
+                       {"ip", J::array({"ext:country-geoip.dat:" + code})},
+                       {"balancerTag", it->second}});
+    }
+  }
+  // Include configured countries with no authorized ingress in xray -test as
+  // well. Their data must exist before a configuration can go live.
+  J denied_countries = J::array();
+  for (const auto &pool : pools)
+    if (!routed_countries.count(pool.first))
+      denied_countries.push_back("ext:country-geoip.dat:" + pool.first);
+  if (!denied_countries.empty())
+    rules.push_back({{"type", "field"}, {"ip", denied_countries},
+                     {"outboundTag", "block"}});
+  rules.push_back(
+      {{"type", "field"}, {"network", "tcp,udp"}, {"outboundTag", "block"}});
+  root["observatory"] = {{"subjectSelector", J::array({"gateway-exit-"})},
+                         {"probeUrl", url},
+                         {"probeInterval", std::to_string(interval) + "s"},
+                         {"enableConcurrency", true}};
+}
+
 static J render(const YAML::Node &c, const J &users) {
   std::string role = c["role"].as<std::string>();
-  if (role != "in" && role != "out")
-    throw std::runtime_error("role must be in or out");
+  if (role != "in" && role != "out" && role != "gateway")
+    throw std::runtime_error("role must be in, out or gateway");
+  if (c["gateway"].IsDefined() != (role == "gateway"))
+    throw std::runtime_error("gateway configuration requires the gateway role");
+  if (c["auto_gateway"].IsDefined() &&
+      (role != "in" || !c["single_client"].IsDefined()))
+    throw std::runtime_error("Auto gateway requires single-client ingress");
   if (c["single_client"].IsDefined() && role != "in")
     throw std::runtime_error("single_client is only valid for ingress");
   if (!users.is_array())
@@ -632,10 +794,10 @@ static J render(const YAML::Node &c, const J &users) {
     address = read("/run/mesh-ip");
   while (!address.empty() && address.back() == '\n')
     address.pop_back();
-  if (role == "out" && !c["allow_insecure_lab"].as<bool>(false) &&
+  if (role != "in" && !c["allow_insecure_lab"].as<bool>(false) &&
       !mesh_ipv4(address))
     throw std::runtime_error(
-        "out listener must bind mesh IPv4 in 100.64.0.0/10");
+        "transit listener must bind mesh IPv4 in 100.64.0.0/10");
   J clients = J::array(), rules = J::array();
   std::set<std::string> ids, emails, exits;
   if (role == "out") {
@@ -664,52 +826,33 @@ static J render(const YAML::Node &c, const J &users) {
     // ingress.
     root["outbounds"].push_back({{"tag", "block"}, {"protocol", "blackhole"}});
     if (!c["exits"] || !c["exits"].IsSequence() || c["exits"].size() == 0)
-      throw std::runtime_error("ingress requires at least one exit");
-    size_t transit_index = 0;
+      throw std::runtime_error("at least one transit exit is required");
+    std::map<std::string, std::string> exit_tags;
     for (auto e : c["exits"]) {
       auto name = e["name"].as<std::string>();
       if (name.empty() || name == "block")
         throw std::runtime_error("exit name is empty or reserved");
       if (!exits.insert(name).second)
         throw std::runtime_error("duplicate exit");
-      if (!c["allow_insecure_lab"].as<bool>(false) &&
-          !mesh_ipv4(e["address"].as<std::string>()))
-        throw std::runtime_error("transit exit must use a mesh IPv4 address");
-      auto id = secret(e["uuid_file"]);
-      uuid(id);
-      auto transit_address = e["address"].as<std::string>();
-      in_addr transit_ip{};
-      const bool mesh_transit = mesh_ipv4(transit_address) && c["mesh"] &&
-                                c["mesh"]["enabled"].as<bool>(true);
-      if (inet_pton(AF_INET, transit_address.c_str(), &transit_ip) == 1) {
-        // Xray rejects plaintext VLESS to CGNAT literals, even when WireGuard
-        // already encrypts the transport. Resolve a private synthetic name
-        // exclusively through this pinned hosts entry; no external DNS lookup.
-        const auto domain =
-            "transit-" + std::to_string(transit_index) + ".mesh.invalid";
-        root["dns"]["hosts"][domain] = transit_address;
-        transit_address = domain;
-      }
-      ++transit_index;
-      root["outbounds"].push_back(
-          {{"tag", name},
-           {"protocol", "vless"},
-           {"settings",
-            {{"vnext",
-              J::array({{{"address", transit_address},
-                         {"port", port(e["port"])},
-                         {"users", J::array({{{"id", id},
-                                              {"encryption", "none"}}})}}})}}},
-           {"streamSettings",
-            {{"network", "tcp"},
-             {"security", "none"},
-             {"sockopt", {{"domainStrategy", "UseIPv4"}}}}}});
-      if (mesh_transit)
-        root["outbounds"].back()["streamSettings"]["sockopt"]["interface"] =
-            "tailscale0";
+      std::string tag = name;
+      if (role == "gateway")
+        tag = "gateway-exit-" + std::to_string(exit_tags.size()) + "/";
+      if (c["auto_gateway"].IsDefined() && name == auto_gateway_tag)
+        throw std::runtime_error("exit name conflicts with Auto gateway");
+      exit_tags.emplace(name, tag);
+      add_transit(c, root, tag, e, exits.size() - 1);
     }
-    if (c["single_client"].IsDefined()) {
-      single_clients(c["single_client"], users, stream, exits, clients, rules);
+    if (role == "gateway") {
+      add_gateway(c, root, exit_tags, clients, rules);
+    } else if (c["single_client"].IsDefined()) {
+      if (c["auto_gateway"].IsDefined()) {
+        add_transit(c, root, auto_gateway_tag, c["auto_gateway"], exits.size());
+        // Forward an IP on the mesh so the gateway filters the same address
+        // the exit will actually dial, including names with multiple answers.
+        root["outbounds"].back()["targetStrategy"] = "ForceIP";
+      }
+      single_clients(c["single_client"], users, stream, exits, clients, rules,
+                     c["auto_gateway"]);
     } else {
       for (auto u : users) {
         auto expiry = u.value("expiryTime", int64_t(0));
@@ -758,7 +901,8 @@ static J render(const YAML::Node &c, const J &users) {
        {"protocol", "vless"},
        {"settings", {{"clients", clients}, {"decryption", "none"}}},
        {"streamSettings", stream}});
-  root["routing"] = {{"domainStrategy", "IPIfNonMatch"}, {"rules", rules}};
+  root["routing"]["domainStrategy"] = role == "gateway" ? "IPOnDemand" : "IPIfNonMatch";
+  root["routing"]["rules"] = rules;
   return root;
 }
 static void mesh(const YAML::Node &c) {

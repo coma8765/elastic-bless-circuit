@@ -1,6 +1,6 @@
 ---
 - name: Resolve per-host deployment settings
-  hosts: headscale:control:exits:ingress
+  hosts: headscale:control:exits:ingress:route_gateways
   gather_facts: false
   any_errors_fatal: true
   roles: [deployment_defaults]
@@ -13,13 +13,14 @@
 - name: Validate topology and prepare controller credentials
   hosts: headscale
   gather_facts: false
+  any_errors_fatal: true
   tasks:
     - name: Prepare the deployment controller
       ansible.builtin.include_tasks: tasks/controller.yml
       run_once: true
 
 - name: Prepare container hosts and images
-  hosts: headscale:control:exits:ingress
+  hosts: headscale:control:exits:ingress:route_gateways
   gather_facts: true
   # Local inventory maps several logical services to one physical machine.
   serial: 1
@@ -57,8 +58,37 @@
   serial: 1
   roles: [node]
 
+- name: Deploy mesh route gateways after their exits have enrolled
+  hosts: route_gateways
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: node
+      vars:
+        node_role: gateway
+
 - name: Deploy ingress with explicit authenticated routes
   hosts: ingress
   gather_facts: false
   serial: 1
   roles: [ingress]
+  tasks:
+    - ansible.builtin.set_fact:
+        auto_ingress_ready: true
+      when: ingress_route_gateway | length > 0
+
+- name: Publish Auto subscriptions after every participating ingress is ready
+  hosts: control
+  gather_facts: false
+  tasks:
+    - name: Check gateway rollout before publishing
+      when: groups.get('route_gateways', []) | length > 0
+      block:
+        - name: Require a successful deployment of each opted-in ingress in this run
+          ansible.builtin.assert:
+            that: hostvars[item].auto_ingress_ready | default(false)
+          loop: '{{ groups.ingress }}'
+          when: hostvars[item].ingress_route_gateway | length > 0
+        - ansible.builtin.include_tasks: tasks/panel-directory.yml

@@ -21,6 +21,18 @@ allow_private_destinations: {{ allow_private_destinations | bool | lower }}
 dns:
   servers: {{ exit_dns_servers | to_json }}
 {% endif %}
+{% elif node_role == 'gateway' %}
+listener: {address: mesh, port: {{ transit_port }}}
+gateway:
+  countries: {{ route_gateway_countries | to_json }}
+  ingresses:
+{% for reader in route_readers %}
+    - name: {{ reader | to_json }}
+      uuid_file: /run/secrets/gateway-{{ reader }}.uuid
+      exits: {{ route_exits | intersect(hostvars[reader].ingress_subscription_exits or groups.exits) | sort | to_json }}
+{% endfor %}
+  probe_url: {{ route_gateway_probe_url | to_json }}
+  probe_interval_seconds: {{ route_gateway_probe_interval_seconds }}
 {% else %}
 sync_seconds: {{ sync_seconds }}
 max_stale_seconds: {{ max_stale_seconds }}
@@ -50,13 +62,24 @@ panel:
   username_file: /run/secrets/panel-user
   password_file: /run/secrets/panel-password
   inbound_id: {{ hostvars[groups.control[0]].panel_directory.inbound_ids[inventory_hostname] if ingress_security == 'reality' else hostvars[groups.control[0]].panel_directory.inbound_id }}
+{% if ingress_route_gateway | default('') %}
+auto_gateway:
+  selector: {{ ingress_auto_selector }}
+  address: {{ hostvars[ingress_route_gateway].mesh_ip | to_json }}
+  port: {{ hostvars[ingress_route_gateway].transit_port }}
+  uuid_file: /run/secrets/gateway-transit.uuid
+{% endif %}
+{% endif %}
+{% if node_role in ['in', 'gateway'] %}
 exits:
-{% for peer in groups.exits %}
+{% for peer in (route_exits if node_role == 'gateway' else groups.exits) %}
   - name: {{ peer | to_json }}
     address: {{ hostvars[peer].mesh_ip | to_json }}
     port: {{ hostvars[peer].transit_port }}
-    uuid_file: /run/secrets/{{ peer }}-uuid
+    uuid_file: /run/secrets/{{ 'exit-' + peer + '.uuid' if node_role == 'gateway' else peer + '-uuid' }}
 {% endfor %}
+{% endif %}
+{% if node_role == 'in' %}
 {% if panel_client_mode | default('grouped') == 'single' %}
 single_client:
   selectors: {{ vless_route_selectors | dict2items | selectattr('key', 'in', ingress_subscription_exits | default([]) or groups.exits) | list | items2dict | to_json }}

@@ -29,20 +29,10 @@
   until: panel_http.status == 200
   retries: 45
   delay: 2
-- name: Reconcile directory users and public subscription endpoints
-  vless_panel:
-    url: http://127.0.0.1:{{ panel_host_port }}
-    username: '{{ panel_username }}'
-    password: '{{ hostvars[groups.headscale[0]].panel_password }}'
-    users: '{{ hostvars[groups.headscale[0]].managed_users }}'
-    client_mode: '{{ panel_client_mode }}'
-    migrate_single_clients: '{{ migrate_single_clients }}'
-    route_selectors: '{{ vless_route_selectors }}'
-    exit_countries: "{{ dict(groups.exits | zip(groups.exits | map('extract', hostvars, 'exit_display_country'))) if panel_client_mode == 'single' else {} }}"
-    ingress_endpoints: '{{ hostvars[groups.headscale[0]].ingress_endpoints }}'
-    subscription_public_url: '{{ subscription_public_url }}'
-  register: panel_directory
-  no_log: true
+- name: Prepare subscription directories for enrolled nodes
+  ansible.builtin.include_tasks: '{{ playbook_dir }}/tasks/panel-directory.yml'
+  vars:
+    defer_new_auto: "{{ groups.get('route_gateways', []) | length > 0 }}"
 - name: Verify the single-client subscription eligibility check
   ansible.builtin.uri:
     url: 'http://127.0.0.1:{{ subscription_host_port }}/sub/mesh-preflight-{{ 999999999999 | random }}'

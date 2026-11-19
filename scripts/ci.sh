@@ -14,6 +14,8 @@ cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Release
 cmake --build build/ci --parallel 2
 "$ci_python" -m compileall -q tests scripts deploy/ansible/library
 "$ci_python" tests/single_client_routing.py --agent build/ci/node-agent
+"$ci_python" tests/gateway_renderer.py --agent build/ci/node-agent
+"$ci_python" tests/gateway_deployment.py
 "$ci_python" tests/single_client_panel.py
 "$ci_python" tests/single_client_migration.py
 "$ci_python" tests/ansible_modules.py
